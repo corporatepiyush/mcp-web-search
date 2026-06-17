@@ -26,18 +26,51 @@ const fn utf8_seq_len(b: u8) -> usize {
     }
 }
 
+/// Scalar helper: collapse whitespace in `bytes[i..end]`, updating `out`
+/// and `prev_was_space`. Returns the final byte position (may exceed `end`
+/// when a multi-byte UTF-8 sequence straddles the boundary).
+#[inline]
+fn scalar_ws(bytes: &[u8], s: &str, mut i: usize, end: usize, out: &mut String, prev_was_space: &mut bool) -> usize {
+    while i < end {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            if !*prev_was_space {
+                out.push(' ');
+                *prev_was_space = true;
+            }
+            i += 1;
+        } else if b < 0x80 {
+            out.push(b as char);
+            *prev_was_space = false;
+            i += 1;
+        } else {
+            let seq_len = utf8_seq_len(b);
+            let seq_end = (i + seq_len).min(bytes.len());
+            out.push_str(&s[i..seq_end]);
+            *prev_was_space = false;
+            i = seq_end;
+        }
+    }
+    i
+}
+
 /// Collapse runs of ASCII whitespace to a single space.
 ///
-/// SIMD strategy (x86_64 SSE2):
-/// - Process input as raw bytes (not chars) so LLVM's auto-vectorizer has a
-///   simple stride-1 byte loop to work with.
-/// - For long ASCII-only regions, an explicit SSE2 loop processes 16 bytes at
-///   a time: one `pcmpgtb`-free comparison per whitespace byte, plus a
-///   `pmovmskb` bitmask to find runs.
-/// - Runs without any whitespace use a single `push_str` (memcpy) instead of
-///   16 individual pushes.
-/// - Multi-byte UTF-8 sequences are handled by copying the full continuation
-///   sequence from the original `&str` slice.
+/// ## SSE2 path (x86_64)
+/// - 16-byte chunked loop; `pmovmskb` non-ASCII check → scalar fallback.
+/// - Whitespace detection via **range check** (article §"SIMD Hash Table"):
+///   one `pcmpeqb` for space, one `paddb` + `pcmpgtb` for the range `[0x09,0x0D]`,
+///   avoiding five individual byte comparisons.
+/// - Bitmask walk with `trailing_zeros` for run extraction.
+///
+/// ## NEON path (aarch64)
+/// - 16-byte chunked loop; `vmaxvq_u8` for both non-ASCII and whitespace checks.
+/// - Same range-check technique with NEON `vsubq_u8` + `vcleq_u8`.
+/// - Absent a direct `movemask`, the "any whitespace" fast path bulk-copies;
+///   mixed chunks fall back to scalar for that window.
+///
+/// ## Generic path
+/// - Simple byte-scan loop (lets LLVM auto-vectorize when possible).
 #[cfg(target_arch = "x86_64")]
 fn collapse_whitespace(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -46,28 +79,7 @@ fn collapse_whitespace(s: &str) -> String {
     let mut prev_was_space = false;
 
     if len < 16 {
-        // Too short for SSE2; use scalar byte loop.
-        let mut i = 0;
-        while i < len {
-            let b = bytes[i];
-            if b.is_ascii_whitespace() {
-                if !prev_was_space {
-                    out.push(' ');
-                    prev_was_space = true;
-                }
-                i += 1;
-            } else if b < 0x80 {
-                out.push(b as char);
-                prev_was_space = false;
-                i += 1;
-            } else {
-                let seq_len = utf8_seq_len(b);
-                let end = (i + seq_len).min(len);
-                out.push_str(&s[i..end]);
-                prev_was_space = false;
-                i = end;
-            }
-        }
+        scalar_ws(bytes, s, 0, len, &mut out, &mut prev_was_space);
         return out;
     }
 
@@ -75,65 +87,46 @@ fn collapse_whitespace(s: &str) -> String {
 
     let mut i = 0;
     unsafe {
-        // Main SSE2 loop: process 16-byte chunks of all-ASCII content.
+        let ones = _mm_set1_epi8(-1i8);
+        // Range check: subtract 9, then unsigned ≤ 4.
+        // Sub9 in [0x00, 0x04] ↔ lane in [0x09, 0x0D].
+        // Use unsigned-compare trick: XOR with 0x80, then signed > 0x84.
+        let sign = _mm_set1_epi8(0x80u8 as i8);
+
         while i + 16 <= len {
             let chunk = _mm_loadu_si128(bytes.as_ptr().add(i) as *const __m128i);
             let non_ascii = _mm_movemask_epi8(chunk) as u32;
 
             if non_ascii != 0 {
-                // Chunk contains non-ASCII bytes; fall back to scalar.
-                let chunk_end = i + 16;
-                while i < chunk_end {
-                    let b = bytes[i];
-                    if b.is_ascii_whitespace() {
-                        if !prev_was_space {
-                            out.push(' ');
-                            prev_was_space = true;
-                        }
-                        i += 1;
-                    } else if b < 0x80 {
-                        out.push(b as char);
-                        prev_was_space = false;
-                        i += 1;
-                    } else {
-                        let seq_len = utf8_seq_len(b);
-                        let end = (i + seq_len).min(len);
-                        out.push_str(&s[i..end]);
-                        prev_was_space = false;
-                        i = end;
-                    }
-                }
+                i = scalar_ws(bytes, s, i, i + 16, &mut out, &mut prev_was_space);
                 continue;
             }
 
-            // ── All-ASCII window ──
-            // Compare against each of the six ASCII whitespace bytes.
-            let sp = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b' ' as i8));
-            let ht = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\t' as i8));
-            let lf = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\n' as i8));
-            let vt = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\x0B' as i8));
-            let ff = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\x0C' as i8));
-            let cr = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\r' as i8));
+            // ── All-ASCII: detect whitespace (article: range check over 5 PCMPEQB) ──
+            let eq_space = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b' ' as i8));
+            let sub9 = _mm_add_epi8(chunk, _mm_set1_epi8((-9i8) as i8));
+            let biased = _mm_xor_si128(sub9, sign);
+            // Unsigned: sub9 > 4 ?  ↔  signed: biased > 0x84 ?
+            let gt4 = _mm_cmpgt_epi8(biased, _mm_set1_epi8(0x84u8 as i8));
+            let in_range = _mm_xor_si128(gt4, ones);
 
-            let ws = _mm_or_si128(sp, _mm_or_si128(ht, lf));
-            let ws = _mm_or_si128(ws, _mm_or_si128(vt, _mm_or_si128(ff, cr)));
+            let ws = _mm_or_si128(eq_space, in_range);
             let ws_mask = _mm_movemask_epi8(ws) as u16;
 
             if ws_mask == 0 {
-                // No whitespace at all — bulk-copy the whole chunk.
                 out.push_str(&s[i..i + 16]);
                 prev_was_space = false;
                 i += 16;
                 continue;
             }
 
-            // One or more whitespace bytes: walk the bitmask in order.
+            // Walk the bitmask (branchless via trailing_zeros).
             let run_start = i;
             let mut bits = ws_mask;
             loop {
                 let trailing_ws = bits.trailing_zeros() as usize;
                 if trailing_ws > 0 {
-                    let copy_end = run_start + (i - run_start) + trailing_ws;
+                    let copy_end = i + trailing_ws;
                     out.push_str(&s[i..copy_end]);
                     i = copy_end;
                     prev_was_space = false;
@@ -148,8 +141,7 @@ fn collapse_whitespace(s: &str) -> String {
                     break;
                 }
             }
-            // Copy any remaining bytes after the last whitespace.
-            let remaining = run_start + 16 - i;
+            let remaining = (run_start + 16).saturating_sub(i);
             if remaining > 0 {
                 out.push_str(&s[i..run_start + 16]);
                 prev_was_space = false;
@@ -158,32 +150,66 @@ fn collapse_whitespace(s: &str) -> String {
         }
     }
 
-    // Scalar remainder for the last <16 bytes.
-    while i < len {
-        let b = bytes[i];
-        if b.is_ascii_whitespace() {
-            if !prev_was_space {
-                out.push(' ');
-                prev_was_space = true;
-            }
-            i += 1;
-        } else if b < 0x80 {
-            out.push(b as char);
-            prev_was_space = false;
-            i += 1;
-        } else {
-            let seq_len = utf8_seq_len(b);
-            let end = (i + seq_len).min(len);
-            out.push_str(&s[i..end]);
-            prev_was_space = false;
-            i = end;
-        }
-    }
+    scalar_ws(bytes, s, i, len, &mut out, &mut prev_was_space);
     out
 }
 
-/// Scalar fallback used on non-x86_64 targets and in the test harness.
-#[cfg(not(target_arch = "x86_64"))]
+/// NEON SIMD path for aarch64 (Apple Silicon, etc.).
+///
+/// Uses the same strategy as SSE2 but without a direct `movemask`:
+/// `vmaxvq_u8` checks whether any lane hit whitespace — if none did,
+/// we bulk-copy the whole 16-byte chunk. Mixed (whitespace + text)
+/// chunks fall back to scalar for that window.
+#[cfg(target_arch = "aarch64")]
+fn collapse_whitespace(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut prev_was_space = false;
+
+    if len < 16 {
+        scalar_ws(bytes, s, 0, len, &mut out, &mut prev_was_space);
+        return out;
+    }
+
+    use std::arch::aarch64::*;
+
+    let mut i = 0;
+    unsafe {
+        while i + 16 <= len {
+            let chunk = vld1q_u8(bytes.as_ptr().add(i));
+
+            // Non-ASCII check via max byte value
+            if vmaxvq_u8(chunk) >= 0x80 {
+                i = scalar_ws(bytes, s, i, i + 16, &mut out, &mut prev_was_space);
+                continue;
+            }
+
+            // All ASCII — detect whitespace
+            let eq_space = vceqq_u8(chunk, vdupq_n_u8(b' '));
+            let sub9 = vsubq_u8(chunk, vdupq_n_u8(9));
+            let le4 = vcleq_u8(sub9, vdupq_n_u8(4));
+            let ws = vorrq_u8(eq_space, le4);
+
+            if vmaxvq_u8(ws) == 0 {
+                // No whitespace — bulk copy
+                out.push_str(&s[i..i + 16]);
+                prev_was_space = false;
+                i += 16;
+                continue;
+            }
+
+            // Has whitespace — scalar fallback for this chunk
+            i = scalar_ws(bytes, s, i, i + 16, &mut out, &mut prev_was_space);
+        }
+    }
+
+    scalar_ws(bytes, s, i, len, &mut out, &mut prev_was_space);
+    out
+}
+
+/// Scalar fallback for targets without explicit SIMD.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn collapse_whitespace(s: &str) -> String {
     let bytes = s.as_bytes();
     let len = bytes.len();
