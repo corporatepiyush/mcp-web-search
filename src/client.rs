@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use std::sync::LazyLock;
 use std::time::Duration;
+use url::Url;
 
 const USER_AGENT: &str = concat!("mcp-web-search/", env!("CARGO_PKG_VERSION"));
 
@@ -41,9 +42,17 @@ pub async fn fetch_page(start: &str, config: &Config) -> Result<FetchedPage> {
     let mut current = validate_url(start, config.allow_private_hosts).await?;
 
     for hop in 0..=config.max_redirects {
+        let client = if config.dns_pin {
+            let pinned = build_pinned_client(&current, config).await?;
+            ClientOrPinned::Pinned(pinned)
+        } else {
+            ClientOrPinned::Shared(&HTTP)
+        };
+        let client_ref = client.as_ref();
+
         let resp = tokio::time::timeout(
             config.server.request_timeout,
-            HTTP.get(current.clone()).send(),
+            client_ref.get(current.clone()).send(),
         )
         .await
         .map_err(|_| WebSearchError::Timeout(format!("fetching {current}")))?
@@ -142,6 +151,68 @@ async fn read_capped(resp: reqwest::Response, max: usize) -> Result<String> {
         );
         s
     }))
+}
+
+enum ClientOrPinned {
+    Shared(&'static reqwest::Client),
+    Pinned(reqwest::Client),
+}
+
+impl AsRef<reqwest::Client> for ClientOrPinned {
+    fn as_ref(&self) -> &reqwest::Client {
+        match self {
+            ClientOrPinned::Shared(c) => c,
+            ClientOrPinned::Pinned(c) => c,
+        }
+    }
+}
+
+/// Resolve a URL's domain, validate every resolved IP against the SSRF guard,
+/// and build a temporary `reqwest::Client` that pins the domain to those IPs.
+/// This eliminates the DNS rebinding TOCTOU window between validation and the
+/// actual HTTP connection, at the cost of losing connection-pool reuse for that
+/// request (typically ~10ms of additional connection setup).
+async fn build_pinned_client(url: &Url, config: &Config) -> Result<reqwest::Client> {
+    use std::net::SocketAddr;
+    use url::Host;
+
+    let domain = match url.host() {
+        Some(Host::Domain(d)) => d.to_string(),
+        _ => return Err(WebSearchError::UrlNotAllowed(
+            "DNS pinning only applies to domain hosts".into(),
+        )),
+    };
+
+    let port = url.port_or_known_default().unwrap_or(0);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((domain.as_str(), port))
+        .await
+        .map_err(|e| WebSearchError::UrlNotAllowed(format!(
+            "DNS pinning: cannot resolve '{domain}': {e}"
+        )))?
+        .collect();
+
+    for addr in &addrs {
+        crate::validation::validate_ip(addr.ip(), config.allow_private_hosts)?;
+    }
+
+    let cpus = num_cpus::get();
+    let pool_max = (cpus * 4).max(32);
+    let mut builder = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(pool_max)
+        .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(30))
+        .http2_keep_alive_interval(Duration::from_secs(30));
+
+    for addr in &addrs {
+        builder = builder.resolve(&domain, *addr);
+    }
+
+    builder
+        .build()
+        .map_err(|e| WebSearchError::HttpError(format!("failed to build pinned client: {e}")))
 }
 
 #[cfg(test)]

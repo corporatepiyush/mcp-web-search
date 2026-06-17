@@ -365,6 +365,8 @@ fn test_config_provider_validation() {
         max_extract_urls: 100,
         max_map_urls: 10000,
         worker_threads: 0,
+        rate_limit: 0.0,
+        dns_pin: false,
     };
     assert!(matches!(
         Config::from_args(&args).unwrap_err(),
@@ -398,6 +400,8 @@ fn test_config_provider_validation() {
         max_extract_urls: 100,
         max_map_urls: 10000,
         worker_threads: 0,
+        rate_limit: 0.0,
+        dns_pin: false,
     };
     assert!(matches!(
         Config::from_args(&args).unwrap_err(),
@@ -431,6 +435,8 @@ fn test_config_provider_validation() {
         max_extract_urls: 100,
         max_map_urls: 10000,
         worker_threads: 0,
+        rate_limit: 0.0,
+        dns_pin: false,
     };
     assert!(Config::from_args(&args).is_ok());
 }

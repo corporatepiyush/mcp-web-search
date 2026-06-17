@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use bytes::Bytes;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,10 +17,12 @@ use tracing::debug;
 
 use crate::config::Config;
 use crate::protocol::JsonRpcRequest;
+use crate::ratelimit::TokenBucket;
 
 #[derive(Clone)]
 pub struct HttpState {
     pub config: Arc<Config>,
+    pub rate_limiter: Option<Arc<TokenBucket>>,
 }
 
 pub async fn create_http_server(
@@ -28,7 +31,12 @@ pub async fn create_http_server(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let host = config.server.host.clone();
     let max_body = config.server.max_request_bytes;
-    let state = HttpState { config };
+    let rate_limiter = if config.server.rate_limit > 0.0 {
+        Some(Arc::new(TokenBucket::new(config.server.rate_limit)))
+    } else {
+        None
+    };
+    let state = HttpState { config, rate_limiter };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -54,18 +62,40 @@ pub async fn create_http_server(
 async fn handle_rpc(
     State(state): State<HttpState>,
     headers: HeaderMap,
-    Json(req): Json<JsonRpcRequest>,
+    body: Bytes,
 ) -> Response {
+    if let Some(ref limiter) = state.rate_limiter {
+        if !limiter.try_acquire() {
+            tracing::warn!("HTTP rate limit exceeded");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit exceeded. Try again later.",
+            )
+                .into_response();
+        }
+    }
+
     if let Some(ref expected) = state.config.server.auth_token {
         let presented = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if !crate::server::token_matches(presented, expected) {
-            tracing::warn!("HTTP auth rejected for method '{}'", req.method);
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
+
+    let req: JsonRpcRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid JSON-RPC request: {e}"),
+            )
+                .into_response();
+        }
+    };
+
     debug!("HTTP RPC: {} (id={:?})", req.method, req.id);
     let response = crate::server::process_request_http(&req, &state.config).await;
     Json(response).into_response()
@@ -92,7 +122,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_endpoint() {
         let config = Arc::new(Config::default());
-        let state = HttpState { config };
+        let state = HttpState { config, rate_limiter: None };
         let app = Router::new()
             .route("/health", get(handle_health))
             .with_state(state);
@@ -123,7 +153,7 @@ mod tests {
         let mut config = Config::default();
         config.server.auth_token = Some(Arc::from("secret123"));
         let config = Arc::new(config);
-        let state = HttpState { config: Arc::clone(&config) };
+        let state = HttpState { config: Arc::clone(&config), rate_limiter: None };
 
         let app = Router::new()
             .route("/rpc", post(handle_rpc))
@@ -157,7 +187,7 @@ mod tests {
         let mut config = Config::default();
         config.server.auth_token = Some(Arc::from("secret123"));
         let config = Arc::new(config);
-        let state = HttpState { config };
+        let state = HttpState { config, rate_limiter: None };
 
         let app = Router::new()
             .route("/rpc", post(handle_rpc))
@@ -200,7 +230,7 @@ mod tests {
         let mut config = Config::default();
         config.server.max_request_bytes = 100;
         let config = Arc::new(config);
-        let state = HttpState { config: Arc::clone(&config) };
+        let state = HttpState { config: Arc::clone(&config), rate_limiter: None };
 
         let app = Router::new()
             .route("/rpc", post(handle_rpc))

@@ -5,6 +5,7 @@ pub mod errors;
 pub mod http;
 pub mod protocol;
 pub mod providers;
+pub mod ratelimit;
 pub mod server;
 pub mod tools;
 pub mod validation;
@@ -95,4 +96,10 @@ pub struct Args {
 
     #[arg(long, default_value_t = 0, help = "Tokio worker threads (0 = auto-detect num_cpus)")]
     pub worker_threads: usize,
+
+    #[arg(long, default_value_t = 0.0, help = "Max requests per second (0 = unlimited)")]
+    pub rate_limit: f64,
+
+    #[arg(long, help = "Pin resolved DNS to prevent rebinding attacks (adds ~10ms per request)")]
+    pub dns_pin: bool,
 }

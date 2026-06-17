@@ -141,6 +141,18 @@ fn guard_ipv6(ip: Ipv6Addr) -> Result<()> {
     Ok(())
 }
 
+/// Validate a resolved IP address against the SSRF guard. Panics if the
+/// address family is unknown (should not happen with std IpAddr).
+pub fn validate_ip(ip: IpAddr, allow_private: bool) -> Result<()> {
+    if allow_private {
+        return Ok(());
+    }
+    match ip {
+        IpAddr::V4(v4) => guard_ipv4(v4),
+        IpAddr::V6(v6) => guard_ipv6(v6),
+    }
+}
+
 /// Check whether a URL resolves to a blocked (internal) address **without**
 /// returning an error. Returns `true` if the host is safe to connect to.
 /// This is a lighter-weight check used for logging/warnings when the actual

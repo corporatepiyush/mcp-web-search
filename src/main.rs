@@ -38,10 +38,14 @@ async fn inner_main(args: Args) -> Result<()> {
     info!(
         provider = %config.provider,
         allow_private = %config.allow_private_hosts,
+        dns_pin = %config.dns_pin,
         "Configuration loaded"
     );
     if config.allow_private_hosts {
         warn!("SSRF guard DISABLED (--allow-private-hosts): scraping may reach internal hosts");
+    }
+    if config.provider == config::SearchProvider::Google {
+        warn!("Google provider sends API key as a URL query parameter. The key may be visible in server access logs and proxy logs.");
     }
 
     let mcp_server = server::MCPServer::from_arc(Arc::clone(&config));

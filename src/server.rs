@@ -9,6 +9,7 @@ use crate::actions;
 use crate::config::Config;
 use crate::errors::{Result as WsResult, WebSearchError};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::ratelimit::TokenBucket;
 use crate::tools;
 use std::sync::Arc;
 use tokio::io::BufReader;
@@ -101,7 +102,7 @@ impl MCPServer {
             match read_line_capped(&mut reader, &mut line, max).await {
                 Ok(LineRead::Eof) => break,
                 Ok(LineRead::Line) => {
-                    process_one_line(&line, &self.config, &mut response_buf, &mut stdout)
+                    process_one_line(&line, &self.config, &None, &mut response_buf, &mut stdout)
                         .await?;
                 }
                 Ok(LineRead::TooLong) => {
@@ -126,22 +127,29 @@ impl MCPServer {
         );
         info!("MCP web-search TCP server listening on {addr}");
 
-        let limiter = Arc::new(Semaphore::new(self.config.server.max_connections));
+        let conn_limiter = Arc::new(Semaphore::new(self.config.server.max_connections));
+        let rate_limiter = if self.config.server.rate_limit > 0.0 {
+            Some(Arc::new(TokenBucket::new(self.config.server.rate_limit)))
+        } else {
+            None
+        };
         let accept_shards = num_cpus::get().clamp(1, 8);
 
         info!(
             accept_shards,
             max_connections = self.config.server.max_connections,
+            rate_limit = self.config.server.rate_limit,
             "Starting TCP accept tasks"
         );
 
         let mut handles = Vec::with_capacity(accept_shards);
         for _ in 0..accept_shards {
             let listener = Arc::clone(&listener);
-            let limiter = Arc::clone(&limiter);
+            let conn_limiter = Arc::clone(&conn_limiter);
+            let rate_limiter = rate_limiter.as_ref().map(Arc::clone);
             let config = Arc::clone(&self.config);
             handles.push(tokio::spawn(async move {
-                accept_loop(listener, limiter, config).await;
+                accept_loop(listener, conn_limiter, rate_limiter, config).await;
             }));
         }
 
@@ -160,11 +168,12 @@ impl MCPServer {
 /// near-kernel-level accept scaling without `SO_REUSEPORT`.
 async fn accept_loop(
     listener: Arc<TcpListener>,
-    limiter: Arc<Semaphore>,
+    conn_limiter: Arc<Semaphore>,
+    rate_limiter: Option<Arc<TokenBucket>>,
     config: Arc<Config>,
 ) {
     loop {
-        let permit = match Arc::clone(&limiter).acquire_owned().await {
+        let permit = match Arc::clone(&conn_limiter).acquire_owned().await {
             Ok(p) => p,
             Err(_) => {
                 error!("Connection semaphore closed, exiting accept loop");
@@ -182,8 +191,9 @@ async fn accept_loop(
             warn!("Failed to set TCP_NODELAY: {e}");
         }
         let config = Arc::clone(&config);
+        let rate_limiter = rate_limiter.as_ref().map(Arc::clone);
         tokio::spawn(async move {
-            if let Err(e) = handle_client(socket, config).await {
+            if let Err(e) = handle_client(socket, config, rate_limiter).await {
                 error!("Client {peer_addr} error: {e}");
             }
             drop(permit);
@@ -191,7 +201,11 @@ async fn accept_loop(
     }
 }
 
-async fn handle_client(socket: TcpStream, config: Arc<Config>) -> WsResult<()> {
+async fn handle_client(
+    socket: TcpStream,
+    config: Arc<Config>,
+    rate_limiter: Option<Arc<TokenBucket>>,
+) -> WsResult<()> {
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, reader);
     let mut line = String::with_capacity(INITIAL_LINE_CAP);
@@ -231,7 +245,7 @@ async fn handle_client(socket: TcpStream, config: Arc<Config>) -> WsResult<()> {
                 if line.trim().is_empty() {
                     continue;
                 }
-                process_one_line(&line, &config, &mut response_buf, &mut writer).await?;
+                process_one_line(&line, &config, &rate_limiter, &mut response_buf, &mut writer).await?;
             }
             Ok(LineRead::TooLong) => {
                 write_oversize_error(&mut response_buf, &mut writer, max).await?;
@@ -266,9 +280,24 @@ async fn write_oversize_error<W: AsyncWriteExt + Unpin>(
 async fn process_one_line<W: AsyncWriteExt + Unpin>(
     line: &str,
     config: &Arc<Config>,
+    rate_limiter: &Option<Arc<TokenBucket>>,
     response_buf: &mut Vec<u8>,
     writer: &mut W,
 ) -> WsResult<()> {
+    if let Some(limiter) = rate_limiter {
+        if !limiter.try_acquire() {
+            let err = WebSearchError::InvalidParams(
+                "Rate limit exceeded. Try again later.".into(),
+            );
+            let response = JsonRpcResponse::error(None, err.error_code(), err.to_string());
+            response_buf.clear();
+            serde_json::to_writer(&mut *response_buf, &response)?;
+            response_buf.extend_from_slice(NEWLINE);
+            writer.write_all(response_buf).await.ok();
+            writer.flush().await.ok();
+            return Ok(());
+        }
+    }
     let (response, is_notification) = match parse_request(line) {
         Ok(req) => {
             let is_notif = req.id.is_none();

@@ -86,6 +86,7 @@ pub struct ServerConfig {
     pub max_map_urls: usize,
     pub auth_token: Option<Arc<str>>,
     pub max_connections: usize,
+    pub rate_limit: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +110,7 @@ pub struct Config {
     pub max_response_bytes: usize,
     pub max_redirects: usize,
     pub allow_private_hosts: bool,
+    pub dns_pin: bool,
 }
 
 impl Config {
@@ -171,10 +173,12 @@ impl Config {
                 } else {
                     (cpus * 256).max(64)
                 },
+                rate_limit: args.rate_limit.max(0.0),
             },
             max_response_bytes: args.max_response_bytes,
             max_redirects: args.max_redirects,
             allow_private_hosts: args.allow_private_hosts,
+            dns_pin: args.dns_pin,
         })
     }
 }
@@ -205,10 +209,12 @@ impl Default for Config {
                 max_map_urls: (cpus * 100).clamp(1000, 100_000),
                 auth_token: None,
                 max_connections: (cpus * 256).max(64),
+                rate_limit: 0.0,
             },
             max_response_bytes: 8 * 1024 * 1024,
             max_redirects: 5,
             allow_private_hosts: false,
+            dns_pin: false,
         }
     }
 }
