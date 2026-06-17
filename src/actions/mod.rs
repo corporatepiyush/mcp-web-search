@@ -1,4 +1,5 @@
 pub mod extract;
+pub mod fetch;
 pub mod map;
 pub mod scrape;
 pub mod search;

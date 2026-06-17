@@ -401,6 +401,12 @@ async fn handle_tools_call(req: &JsonRpcRequest, config: &Config) -> WsResult<Va
         "web_scrape" => actions::scrape::web_scrape(tool_args, config).await,
         "web_map" => actions::map::web_map(tool_args, config).await,
         "web_extract" => actions::extract::web_extract(tool_args, config).await,
+        "web_fetch" => actions::scrape::web_fetch(tool_args, config).await,
+        "web_fetch_text" => actions::scrape::web_fetch_text(tool_args, config).await,
+        "web_fetch_headers" => actions::fetch::web_fetch_headers(tool_args, config).await,
+        "web_search_scrape" => actions::search::web_search_scrape(tool_args, config).await,
+        "web_sitemap" => actions::fetch::web_sitemap(tool_args, config).await,
+        "web_check_links" => actions::fetch::web_check_links(tool_args, config).await,
         other => Err(WebSearchError::MethodNotFound(other.to_string())),
     };
 

@@ -10,10 +10,16 @@ pub struct ToolMeta {
 
 #[rustfmt::skip]
 pub const ALL_TOOLS: &[ToolMeta] = &[
-    ToolMeta { name: "web_search",  write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_scrape",  write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_map",     write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_extract", write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_search",       write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_scrape",       write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_map",          write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_extract",      write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_fetch",        write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_fetch_text",   write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_fetch_headers",write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_search_scrape",write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_sitemap",      write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_check_links",  write: false, idempotent: true, destructive: false },
 ];
 
 /// Pre-deserialized tools list response, cached for the lifetime of the process.
@@ -51,20 +57,40 @@ mod tests {
 
     #[test]
     fn test_tool_exists() {
-        assert!(tool_exists("web_search"));
-        assert!(tool_exists("web_scrape"));
-        assert!(tool_exists("web_map"));
-        assert!(tool_exists("web_extract"));
+        for name in [
+            "web_search",
+            "web_scrape",
+            "web_map",
+            "web_extract",
+            "web_fetch",
+            "web_fetch_text",
+            "web_fetch_headers",
+            "web_search_scrape",
+            "web_sitemap",
+            "web_check_links",
+        ] {
+            assert!(tool_exists(name), "tool_exists('{name}') should be true");
+        }
         assert!(!tool_exists("nonexistent"));
         assert!(!tool_exists(""));
     }
 
     #[test]
     fn test_no_write_tools() {
-        assert!(!is_write_tool("web_search"));
-        assert!(!is_write_tool("web_scrape"));
-        assert!(!is_write_tool("web_map"));
-        assert!(!is_write_tool("web_extract"));
+        for name in [
+            "web_search",
+            "web_scrape",
+            "web_map",
+            "web_extract",
+            "web_fetch",
+            "web_fetch_text",
+            "web_fetch_headers",
+            "web_search_scrape",
+            "web_sitemap",
+            "web_check_links",
+        ] {
+            assert!(!is_write_tool(name), "is_write_tool('{name}') should be false");
+        }
     }
 
     #[test]
@@ -101,7 +127,18 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        for expected in ["web_search", "web_scrape", "web_map", "web_extract"] {
+        for expected in [
+            "web_search",
+            "web_scrape",
+            "web_map",
+            "web_extract",
+            "web_fetch",
+            "web_fetch_text",
+            "web_fetch_headers",
+            "web_search_scrape",
+            "web_sitemap",
+            "web_check_links",
+        ] {
             assert!(names.contains(&expected), "Missing tool: {expected}");
         }
     }

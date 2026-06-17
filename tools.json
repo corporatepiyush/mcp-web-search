@@ -75,5 +75,84 @@
       "required": ["urls"]
     },
     "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "web_fetch",
+    "description": "Fetch a single web page and return its content as markdown. A simpler alternative to web_scrape for the common case — just provide a URL and get readable content back with no options required. Uses the efficient dom_to_markdown path (single HTML parse, no htmd). SSRF-guarded.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "The http/https URL to fetch." }
+      },
+      "required": ["url"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "web_fetch_text",
+    "description": "Fetch a single web page and return its content as plain text with all HTML tags stripped. Use this when you want raw text without any markdown formatting, for example to feed into another text-processing pipeline. Lighter than full markdown conversion.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "The http/https URL to fetch." }
+      },
+      "required": ["url"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "web_fetch_headers",
+    "description": "Fetch only the HTTP response headers and status code for a URL without downloading the body. Use this to check whether a page is accessible, redirected, or returns an error — much faster than a full fetch when you only need metadata about the resource.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "The http/https URL to check." }
+      },
+      "required": ["url"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "web_search_scrape",
+    "description": "Search the web and scrape the top N results into markdown in a single MCP call. This compound operation saves round trips compared to calling web_search then web_scrape for each result. URLs are fetched concurrently (bounded parallelism) and each is SSRF-guarded.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "The search query string." },
+        "limit": { "type": "number", "description": "Maximum SERP results (default 5, clamped 1-20)." },
+        "scrapeLimit": { "type": "number", "description": "Maximum results to scrape into full markdown (default 3, clamped 1-10)." }
+      },
+      "required": ["query"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "web_sitemap",
+    "description": "Parse a website's sitemap.xml and return the list of discovered URLs. The sitemap is fetched from {origin}/sitemap.xml. Use this for site enumeration, content auditing, or finding all pages on a domain before selective scraping.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "The http/https URL whose sitemap.xml to fetch. The sitemap is looked up at the URL's origin." },
+        "limit": { "type": "number", "description": "Maximum number of URLs to return (default 5000)." }
+      },
+      "required": ["url"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "web_check_links",
+    "description": "Check whether a list of URLs are reachable by sending HEAD requests in parallel (bounded concurrency). Returns HTTP status code and reason phrase for each URL. Use this to validate links, detect broken pages, or audit site health. SSRF-guarded on every URL.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "urls": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of http/https URLs to check."
+        }
+      },
+      "required": ["urls"]
+    },
+    "annotations": { "readOnlyHint": true }
   }
 ]
