@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::CorsLayer,
     limit::RequestBodyLimitLayer,
 };
 use tracing::debug;
@@ -39,7 +39,6 @@ pub async fn create_http_server(
     let state = HttpState { config, rate_limiter };
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
         .allow_methods([Method::POST, Method::GET])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .max_age(Duration::from_secs(3600));
@@ -67,11 +66,16 @@ async fn handle_rpc(
     if let Some(ref limiter) = state.rate_limiter {
         if !limiter.try_acquire() {
             tracing::warn!("HTTP rate limit exceeded");
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                "Rate limit exceeded. Try again later.",
-            )
-                .into_response();
+            let err = crate::errors::WebSearchError::RateLimited(
+                "Rate limit exceeded. Try again later.".into(),
+            );
+            let resp = crate::protocol::JsonRpcResponse::error_with_data(
+                None,
+                err.error_code(),
+                err.to_string(),
+                err.error_data().unwrap_or_default(),
+            );
+            return (StatusCode::TOO_MANY_REQUESTS, Json(resp)).into_response();
         }
     }
 

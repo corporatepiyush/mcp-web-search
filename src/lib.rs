@@ -70,7 +70,7 @@ pub struct Args {
     #[arg(long, default_value = "30")]
     pub request_timeout: u64,
 
-    #[arg(long, default_value = "16777216")]
+    #[arg(long, default_value = "1048576")]
     pub max_request_bytes: usize,
 
     #[arg(long, default_value = "8388608")]
@@ -84,6 +84,9 @@ pub struct Args {
 
     #[arg(long)]
     pub auth_token: Option<String>,
+
+    #[arg(long, help = "Read auth token from file (more secure than --auth-token which is visible in process list)")]
+    pub auth_token_file: Option<String>,
 
     #[arg(long, default_value_t = 0, help = "Max concurrent TCP connections (0 = auto-scale to num_cpus * 256)")]
     pub max_connections: usize,
@@ -100,6 +103,6 @@ pub struct Args {
     #[arg(long, default_value_t = 0.0, help = "Max requests per second (0 = unlimited)")]
     pub rate_limit: f64,
 
-    #[arg(long, help = "Pin resolved DNS to prevent rebinding attacks (adds ~10ms per request)")]
+    #[arg(long, default_value_t = true, help = "Pin resolved DNS to prevent rebinding attacks (adds ~10ms per request). Use --no-dns-pin to disable")]
     pub dns_pin: bool,
 }

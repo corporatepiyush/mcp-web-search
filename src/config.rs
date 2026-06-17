@@ -167,7 +167,16 @@ impl Config {
                 } else {
                     (cpus * 100).clamp(1000, 100_000)
                 },
-                auth_token: args.auth_token.as_ref().map(|s| Arc::from(s.as_str())),
+                auth_token: {
+                    let raw = if let Some(ref t) = args.auth_token {
+                        Some(t.clone())
+                    } else if let Some(ref path) = args.auth_token_file {
+                        std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+                    } else {
+                        None
+                    };
+                    raw.map(|s| Arc::from(s.as_str()))
+                },
                 max_connections: if args.max_connections > 0 {
                     args.max_connections
                 } else {
@@ -204,7 +213,7 @@ impl Default for Config {
                 port: 3000,
                 http_port: 3001,
                 request_timeout: Duration::from_secs(30),
-                max_request_bytes: 16 * 1024 * 1024,
+                max_request_bytes: 1024 * 1024,
                 max_extract_urls: (cpus * 2).max(100),
                 max_map_urls: (cpus * 100).clamp(1000, 100_000),
                 auth_token: None,
@@ -214,7 +223,7 @@ impl Default for Config {
             max_response_bytes: 8 * 1024 * 1024,
             max_redirects: 5,
             allow_private_hosts: false,
-            dns_pin: false,
+            dns_pin: true,
         }
     }
 }

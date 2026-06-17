@@ -42,7 +42,9 @@ pub async fn fetch_page(start: &str, config: &Config) -> Result<FetchedPage> {
     let mut current = validate_url(start, config.allow_private_hosts).await?;
 
     for hop in 0..=config.max_redirects {
-        let client = if config.dns_pin {
+        let client = if config.dns_pin
+            && matches!(current.host(), Some(url::Host::Domain(_)))
+        {
             let pinned = build_pinned_client(&current, config).await?;
             ClientOrPinned::Pinned(pinned)
         } else {
@@ -95,15 +97,8 @@ pub async fn fetch_page(start: &str, config: &Config) -> Result<FetchedPage> {
 
         if !status.is_success() {
             let status_code = status.as_u16();
-            let body_preview = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect::<String>();
             return Err(WebSearchError::HttpError(format!(
-                "{current} returned HTTP {status_code}: {body_preview}"
+                "{current} returned HTTP {status_code}"
             )));
         }
 

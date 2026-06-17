@@ -57,7 +57,8 @@ pub async fn web_fetch_headers(args: Option<&Value>, config: &Config) -> Result<
         let mut lines = format!("URL: {current}\nStatus: {status_code} {status_text}\n\nHeaders:\n");
         for (name, value) in resp.headers() {
             if let Ok(v) = value.to_str() {
-                lines.push_str(&format!("{}: {}\n", name.as_str(), v));
+                use std::fmt::Write;
+                let _ = write!(lines, "{}: {}\n", name.as_str(), v);
             }
         }
 

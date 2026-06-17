@@ -101,16 +101,19 @@ pub async fn web_search_scrape(args: Option<&Value>, config: &Config) -> Result<
     let mut output = String::new();
     for (i, r) in results[..to_scrape].iter().enumerate() {
         if i < sections.len() {
-            output.push_str(&format!(
+            use std::fmt::Write;
+            let _ = write!(
+                output,
                 "## {} — {}\n\n{}\n\n{}\n\n---\n\n",
                 r.title, r.url, r.snippet, sections[i]
-            ));
+            );
         }
     }
 
     // Append remaining (unscraped) results as plain SERP entries
     for r in &results[to_scrape..] {
-        output.push_str(&format!("## {} — {}\n\n{}\n\n---\n\n", r.title, r.url, r.snippet));
+        use std::fmt::Write;
+        let _ = write!(output, "## {} — {}\n\n{}\n\n---\n\n", r.title, r.url, r.snippet);
     }
 
     Ok(text_content(if output.is_empty() {

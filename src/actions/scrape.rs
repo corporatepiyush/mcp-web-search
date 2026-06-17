@@ -701,7 +701,8 @@ pub fn collect_links(html: &str, base: &Url) -> Vec<String> {
             && let Ok(abs) = base.join(href)
         {
             let s = abs.to_string();
-            if seen.insert(s.clone()) {
+            if !seen.contains(&s) {
+                seen.insert(s.clone());
                 out.push(s);
             }
         }

@@ -1,5 +1,4 @@
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,23 +27,26 @@ enum LineRead {
 }
 
 /// Read one line from a buffered reader, capping at `max` bytes.
-/// Uses `read_until` for a single-copy path: the data moves directly from
-/// the BufReader's internal buffer into the line buffer without the
-/// fill_buf → scan → extend dance of the previous implementation.
-async fn read_line_capped<R>(reader: &mut R, out: &mut String, max: usize) -> std::io::Result<LineRead>
+/// Reuses `buf` and `out` across calls to avoid per-line allocations.
+async fn read_line_capped<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    out: &mut String,
+    max: usize,
+) -> std::io::Result<LineRead>
 where
     R: AsyncBufReadExt + Unpin,
 {
+    buf.clear();
     out.clear();
-    let mut buf: Vec<u8> = Vec::with_capacity(INITIAL_LINE_CAP);
-    let n = reader.read_until(b'\n', &mut buf).await?;
+    let n = reader.read_until(b'\n', buf).await?;
     if n == 0 {
         return Ok(LineRead::Eof);
     }
     if buf.len() > max {
         return Ok(LineRead::TooLong);
     }
-    *out = String::from_utf8_lossy(&buf).into_owned();
+    *out = String::from_utf8_lossy(buf).into_owned();
     Ok(LineRead::Line)
 }
 
@@ -55,9 +57,7 @@ pub fn token_matches(presented: &str, expected: &str) -> bool {
         .strip_prefix("Bearer ")
         .unwrap_or(presented)
         .trim();
-    let h_presented = Sha256::digest(presented.as_bytes());
-    let h_expected = Sha256::digest(expected.as_bytes());
-    h_presented.ct_eq(&h_expected).into()
+    presented.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 fn parse_error(msg: String) -> JsonRpcResponse {
@@ -95,11 +95,12 @@ impl MCPServer {
         let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, stdin);
         let mut stdout = tokio::io::stdout();
         let mut line = String::with_capacity(INITIAL_LINE_CAP);
+        let mut read_buf = Vec::with_capacity(INITIAL_LINE_CAP);
         let mut response_buf = Vec::with_capacity(INITIAL_RESP_BUF);
         let max = self.config.server.max_request_bytes;
 
         loop {
-            match read_line_capped(&mut reader, &mut line, max).await {
+            match read_line_capped(&mut reader, &mut read_buf, &mut line, max).await {
                 Ok(LineRead::Eof) => break,
                 Ok(LineRead::Line) => {
                     process_one_line(&line, &self.config, &None, &mut response_buf, &mut stdout)
@@ -209,11 +210,12 @@ async fn handle_client(
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, reader);
     let mut line = String::with_capacity(INITIAL_LINE_CAP);
+    let mut read_buf = Vec::with_capacity(INITIAL_LINE_CAP);
     let mut response_buf = Vec::with_capacity(INITIAL_RESP_BUF);
     let max = config.server.max_request_bytes;
 
     if let Some(ref expected) = config.server.auth_token {
-        match read_line_capped(&mut reader, &mut line, max).await {
+        match read_line_capped(&mut reader, &mut read_buf, &mut line, max).await {
             Ok(LineRead::Line) if token_matches(&line, expected) => {
                 info!("Client authenticated successfully");
             }
@@ -239,7 +241,7 @@ async fn handle_client(
     }
 
     loop {
-        match read_line_capped(&mut reader, &mut line, max).await {
+        match read_line_capped(&mut reader, &mut read_buf, &mut line, max).await {
             Ok(LineRead::Eof) => break,
             Ok(LineRead::Line) => {
                 if line.trim().is_empty() {
@@ -286,10 +288,13 @@ async fn process_one_line<W: AsyncWriteExt + Unpin>(
 ) -> WsResult<()> {
     if let Some(limiter) = rate_limiter {
         if !limiter.try_acquire() {
-            let err = WebSearchError::InvalidParams(
-                "Rate limit exceeded. Try again later.".into(),
+            let err = WebSearchError::RateLimited("Rate limit exceeded. Try again later.".into());
+            let response = JsonRpcResponse::error_with_data(
+                None,
+                err.error_code(),
+                err.to_string(),
+                err.error_data().unwrap_or_default(),
             );
-            let response = JsonRpcResponse::error(None, err.error_code(), err.to_string());
             response_buf.clear();
             serde_json::to_writer(&mut *response_buf, &response)?;
             response_buf.extend_from_slice(NEWLINE);
@@ -599,13 +604,14 @@ mod tests {
     async fn test_read_line_capped_normal() {
         let data = b"hello\nworld\n";
         let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
         let mut line = String::new();
-        let res = read_line_capped(&mut reader, &mut line, 100).await.unwrap();
+        let res = read_line_capped(&mut reader, &mut buf, &mut line, 100).await.unwrap();
         assert_eq!(res, LineRead::Line);
         assert_eq!(line, "hello\n");
-        let _ = read_line_capped(&mut reader, &mut line, 100).await.unwrap();
+        let _ = read_line_capped(&mut reader, &mut buf, &mut line, 100).await.unwrap();
         assert_eq!(line, "world\n");
-        let res = read_line_capped(&mut reader, &mut line, 100).await.unwrap();
+        let res = read_line_capped(&mut reader, &mut buf, &mut line, 100).await.unwrap();
         assert_eq!(res, LineRead::Eof);
     }
 
@@ -613,8 +619,9 @@ mod tests {
     async fn test_read_line_capped_oversize() {
         let data = vec![b'a'; 1024];
         let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
         let mut line = String::new();
-        let res = read_line_capped(&mut reader, &mut line, 100).await.unwrap();
+        let res = read_line_capped(&mut reader, &mut buf, &mut line, 100).await.unwrap();
         assert_eq!(res, LineRead::TooLong);
     }
 
@@ -622,8 +629,9 @@ mod tests {
     async fn test_read_line_capped_exact_fit() {
         let data = b"hello\n";
         let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
         let mut line = String::new();
-        let res = read_line_capped(&mut reader, &mut line, 6).await.unwrap();
+        let res = read_line_capped(&mut reader, &mut buf, &mut line, 6).await.unwrap();
         assert_eq!(res, LineRead::Line);
         assert_eq!(line, "hello\n");
     }
@@ -632,8 +640,9 @@ mod tests {
     async fn test_read_line_capped_empty() {
         let data = b"";
         let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
         let mut line = String::new();
-        let res = read_line_capped(&mut reader, &mut line, 100).await.unwrap();
+        let res = read_line_capped(&mut reader, &mut buf, &mut line, 100).await.unwrap();
         assert_eq!(res, LineRead::Eof);
     }
 

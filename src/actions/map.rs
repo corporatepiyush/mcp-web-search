@@ -34,6 +34,12 @@ pub async fn web_map(args: Option<&Value>, config: &Config) -> Result<Value> {
         if !host_allowed(&url, &base_host, include_subdomains) {
             return;
         }
+        // Validate URL scheme and resolve DNS. This is defense-in-depth —
+        // fetch_page also validates, but we catch issues here to avoid
+        // leaking reachable IPs in error messages.
+        if crate::validation::validate_url_blocking(&url, config.allow_private_hosts).is_err() {
+            return;
+        }
         if let Some(ref f) = filter
             && !url.to_lowercase().contains(f.as_str())
         {

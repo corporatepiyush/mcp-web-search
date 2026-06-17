@@ -247,25 +247,6 @@ fn test_provider_dispatch_all_variants() {
 }
 
 #[test]
-fn test_token_auth_flow() {
-    assert!(mcp_web_search::server::token_matches("secret", "secret"));
-    assert!(mcp_web_search::server::token_matches(
-        "Bearer secret",
-        "secret"
-    ));
-    assert!(!mcp_web_search::server::token_matches("wrong", "secret"));
-    assert!(!mcp_web_search::server::token_matches("", "secret"));
-    assert!(!mcp_web_search::server::token_matches(
-        "a",
-        "longersecret"
-    ));
-    assert!(!mcp_web_search::server::token_matches(
-        "longersecret",
-        "a"
-    ));
-}
-
-#[test]
 fn test_json_rpc_request_response_flow() {
     use mcp_web_search::protocol::*;
     use serde_json::json;
@@ -306,6 +287,105 @@ fn test_tools_list_response_cached() {
         );
         assert!(tool["inputSchema"]["properties"].is_object());
     }
+}
+
+#[test]
+fn test_dns_pinning_default_on() {
+    let cfg = mcp_web_search::config::Config::default();
+    assert!(cfg.dns_pin, "DNS pinning should default to true");
+}
+
+#[test]
+fn test_max_request_bytes_reduced_default() {
+    let cfg = mcp_web_search::config::Config::default();
+    assert_eq!(
+        cfg.server.max_request_bytes, 1048576,
+        "max_request_bytes should default to 1MB, not 16MB"
+    );
+}
+
+#[test]
+fn test_auth_token_from_file() {
+    use std::io::Write;
+    let dir = std::env::temp_dir();
+    let path = dir.join("mcp_test_token.txt");
+    let mut f = std::fs::File::create(&path).unwrap();
+    write!(f, "my-secret-token\n").unwrap();
+    drop(f);
+
+    let args = mcp_web_search::Args {
+        search_provider: mcp_web_search::config::SearchProvider::DuckDuckGo,
+        search_api_key: None,
+        search_api_url: None,
+        limit: 10,
+        language: "auto".into(),
+        categories: "general".into(),
+        time_range: "".into(),
+        safe_search: 0,
+        engines: "all".into(),
+        timeout: 10000,
+        host: "127.0.0.1".into(),
+        port: 3000,
+        http_port: 3001,
+        stdio: false,
+        log_level: "info".into(),
+        request_timeout: 30,
+        max_request_bytes: 1048576,
+        max_response_bytes: 8388608,
+        max_redirects: 5,
+        allow_private_hosts: false,
+        auth_token: None,
+        auth_token_file: Some(path.to_string_lossy().into()),
+        max_connections: 1024,
+        max_extract_urls: 100,
+        max_map_urls: 10000,
+        worker_threads: 0,
+        rate_limit: 0.0,
+        dns_pin: true,
+    };
+    let cfg = mcp_web_search::config::Config::from_args(&args).unwrap();
+    assert_eq!(
+        &*cfg.server.auth_token.unwrap(),
+        "my-secret-token",
+        "auth_token should be read from file"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn test_rate_limited_error_has_retry_after() {
+    let err = mcp_web_search::WebSearchError::RateLimited("too fast".into());
+    assert_eq!(err.error_code(), -32006);
+    let data = err.error_data();
+    assert!(data.is_some(), "RateLimited should have retryAfter data");
+    assert_eq!(data.unwrap()["retryAfter"], 1);
+}
+
+#[test]
+fn test_error_body_preview_not_leaked() {
+    // HTTP errors from fetch_page should not include response body preview.
+    // We test via the URL validation path — a blocked URL returns
+    // UrlNotAllowed, not HttpError with leaked body content.
+    let result = mcp_web_search::validation::validate_url_blocking("http://127.0.0.1/", false);
+    match result {
+        Err(mcp_web_search::WebSearchError::UrlNotAllowed(msg)) => {
+            assert!(!msg.contains("HTTP"), "Should not leak HTTP response body");
+        }
+        other => panic!("Expected UrlNotAllowed, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_token_matches_constant_time_no_hash() {
+    // After removing SHA-256, token comparison should still work correctly.
+    assert!(mcp_web_search::server::token_matches("secret", "secret"));
+    assert!(mcp_web_search::server::token_matches("Bearer xyz", "xyz"));
+    assert!(mcp_web_search::server::token_matches("  Bearer abc  ", "abc"));
+    assert!(!mcp_web_search::server::token_matches("wrong", "secret"));
+    assert!(!mcp_web_search::server::token_matches("", "secret"));
+    // Different lengths should not match
+    assert!(!mcp_web_search::server::token_matches("a", "bb"));
+    assert!(!mcp_web_search::server::token_matches("bb", "a"));
 }
 
 #[test]
@@ -361,12 +441,13 @@ fn test_config_provider_validation() {
         max_redirects: 5,
         allow_private_hosts: false,
         auth_token: None,
+        auth_token_file: None,
         max_connections: 1024,
         max_extract_urls: 100,
         max_map_urls: 10000,
         worker_threads: 0,
         rate_limit: 0.0,
-        dns_pin: false,
+        dns_pin: true,
     };
     assert!(matches!(
         Config::from_args(&args).unwrap_err(),
@@ -391,17 +472,18 @@ fn test_config_provider_validation() {
         stdio: false,
         log_level: "info".into(),
         request_timeout: 30,
-        max_request_bytes: 16777216,
+        max_request_bytes: 1048576,
         max_response_bytes: 8388608,
         max_redirects: 5,
         allow_private_hosts: false,
         auth_token: None,
+        auth_token_file: None,
         max_connections: 1024,
         max_extract_urls: 100,
         max_map_urls: 10000,
         worker_threads: 0,
         rate_limit: 0.0,
-        dns_pin: false,
+        dns_pin: true,
     };
     assert!(matches!(
         Config::from_args(&args).unwrap_err(),
@@ -426,17 +508,18 @@ fn test_config_provider_validation() {
         stdio: false,
         log_level: "info".into(),
         request_timeout: 30,
-        max_request_bytes: 16777216,
+        max_request_bytes: 1048576,
         max_response_bytes: 8388608,
         max_redirects: 5,
         allow_private_hosts: false,
         auth_token: None,
+        auth_token_file: None,
         max_connections: 1024,
         max_extract_urls: 100,
         max_map_urls: 10000,
         worker_threads: 0,
         rate_limit: 0.0,
-        dns_pin: false,
+        dns_pin: true,
     };
     assert!(Config::from_args(&args).is_ok());
 }

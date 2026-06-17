@@ -45,8 +45,8 @@ pub async fn web_extract(args: Option<&Value>, config: &Config) -> Result<Value>
             match io_result {
                 Ok(page) => {
                     let body = page.body;
-                    match tokio::task::spawn_blocking(move || {
-                        scrape::to_markdown(&scrape::extract_main(&body))
+                    match tokio::task::spawn_blocking(move || -> crate::errors::Result<String> {
+                        Ok(scrape::main_to_markdown(&body))
                     })
                     .await
                     {
