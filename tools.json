@@ -1,0 +1,79 @@
+[
+  {
+    "name": "web_search",
+    "description": "Search the web and return SERP results (title, URL, description) from the configured provider (searxng, duckduckgo, bing, tavily, google, zhipu, exa, or bocha). Use this to find pages relevant to a query before optionally scraping or extracting their content. Returns a list of results formatted as Title/URL/Description blocks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "The search query string." },
+        "limit": { "type": "number", "description": "Maximum number of results to return (default 10, clamped 1-100)." },
+        "language": { "type": "string", "description": "Language code for results, or 'auto' (default)." },
+        "categories": {
+          "type": "string",
+          "enum": ["general", "news", "images", "videos", "it", "science", "map", "music", "files", "social_media"],
+          "description": "Result category (default 'general'). Honored by providers that support it (e.g. searxng, tavily topic)."
+        },
+        "timeRange": {
+          "type": "string",
+          "enum": ["all", "day", "week", "month", "year"],
+          "description": "Restrict results to a recency window (default 'all')."
+        },
+        "safeSearch": { "type": "number", "description": "Safe-search level: 0=off, 1=moderate, 2=strict (default 0)." },
+        "engines": { "type": "string", "description": "Provider-specific engine selector (e.g. searxng engine list, zhipu engine)." }
+      },
+      "required": ["query"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "web_scrape",
+    "description": "Fetch a single web page over HTTP and return its content in the requested formats. Conversion happens server-side with no browser and no JavaScript execution, so it is fast and safe. Every URL is validated by an SSRF guard that blocks loopback, private, and link-local addresses. Supports markdown, html, rawHtml, and links output. Screenshot and scripted-action formats are intentionally unsupported (they require a real browser).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "The http/https URL to scrape. Must resolve to a public address unless the server was started with --allow-private-hosts." },
+        "formats": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["markdown", "html", "rawHtml", "links", "extract"] },
+          "description": "Content formats to return (default ['markdown']). 'links' returns absolute URLs found on the page; 'rawHtml' returns the unmodified HTML; 'extract' is an alias for 'markdown'."
+        },
+        "onlyMainContent": { "type": "boolean", "description": "When true, isolate the page's main/article region before conversion, dropping navigation and chrome (default false)." }
+      },
+      "required": ["url"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "web_map",
+    "description": "Discover URLs reachable from a starting URL, using the site's sitemap.xml and/or in-page HTML links. Useful for enumerating a site before targeted scraping. Results are restricted to the starting host (optionally including subdomains) and can be filtered by a search substring. SSRF-guarded.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "Starting http/https URL for discovery." },
+        "search": { "type": "string", "description": "Optional case-insensitive substring; only URLs containing it are returned." },
+        "ignoreSitemap": { "type": "boolean", "description": "Skip sitemap.xml discovery and use only in-page HTML links (default false)." },
+        "sitemapOnly": { "type": "boolean", "description": "Use only sitemap.xml, ignore in-page HTML links (default false)." },
+        "includeSubdomains": { "type": "boolean", "description": "Include URLs from subdomains of the starting host (default false)." },
+        "limit": { "type": "number", "description": "Maximum number of URLs to return (default 5000)." }
+      },
+      "required": ["url"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "web_extract",
+    "description": "Fetch one or more URLs over HTTP and return their cleaned main content as markdown, concatenated with per-URL headers. URLs are fetched concurrently (bounded parallelism) and each is SSRF-guarded; a failure on one URL is reported inline without failing the others. Use this to gather readable content from a known set of pages.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "urls": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of http/https URLs to fetch and extract."
+        }
+      },
+      "required": ["urls"]
+    },
+    "annotations": { "readOnlyHint": true }
+  }
+]
