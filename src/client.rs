@@ -42,14 +42,7 @@ pub async fn fetch_page(start: &str, config: &Config) -> Result<FetchedPage> {
     let mut current = validate_url(start, config.allow_private_hosts).await?;
 
     for hop in 0..=config.max_redirects {
-        let client = if config.dns_pin
-            && matches!(current.host(), Some(url::Host::Domain(_)))
-        {
-            let pinned = build_pinned_client(&current, config).await?;
-            ClientOrPinned::Pinned(pinned)
-        } else {
-            ClientOrPinned::Shared(&HTTP)
-        };
+        let client = client_for(&current, config).await?;
         let client_ref = client.as_ref();
 
         let resp = tokio::time::timeout(
@@ -115,12 +108,15 @@ pub async fn fetch_page(start: &str, config: &Config) -> Result<FetchedPage> {
     )))
 }
 
-/// Stream a response body, aborting if it exceeds `max` bytes.
-/// Accumulates `Bytes` chunks without copying until the final concatenation
-/// so IO and accounting can proceed without per-chunk memcpy.
+/// Stream a response body into a single buffer, aborting as soon as the
+/// accumulated size exceeds `max` bytes. Bounds peak memory to roughly the cap
+/// (one buffer), rather than holding every chunk plus a concatenated copy.
 async fn read_capped(resp: reqwest::Response, max: usize) -> Result<String> {
     let mut stream = resp.bytes_stream();
-    let mut chunks: Vec<Bytes> = Vec::with_capacity(16);
+    // Reserve a modest floor to avoid repeated early reallocations on typical
+    // pages, without over-allocating `max` (which may be multiple MiB) for a
+    // tiny response.
+    let mut buf: Vec<u8> = Vec::with_capacity(max.min(64 * 1024));
     let mut total: usize = 0;
     while let Some(chunk) = stream.next().await {
         let chunk: Bytes =
@@ -131,12 +127,7 @@ async fn read_capped(resp: reqwest::Response, max: usize) -> Result<String> {
                 "response body exceeds {max} bytes"
             )));
         }
-        chunks.push(chunk);
-    }
-    // Single pass: concatenate all accumulated chunks.
-    let mut buf: Vec<u8> = Vec::with_capacity(total.min(max));
-    for c in &chunks {
-        buf.extend_from_slice(c);
+        buf.extend_from_slice(&chunk);
     }
     Ok(String::from_utf8(buf).unwrap_or_else(|e| {
         let s = String::from_utf8_lossy(e.as_bytes()).into_owned();
@@ -148,7 +139,11 @@ async fn read_capped(resp: reqwest::Response, max: usize) -> Result<String> {
     }))
 }
 
-enum ClientOrPinned {
+/// An HTTP client to use for a single validated request: either the shared
+/// connection-pooled client, or a per-request client that pins the target
+/// domain to the IPs we validated (closing the DNS-rebinding TOCTOU window).
+#[derive(Debug)]
+pub enum ClientOrPinned {
     Shared(&'static reqwest::Client),
     Pinned(reqwest::Client),
 }
@@ -159,6 +154,25 @@ impl AsRef<reqwest::Client> for ClientOrPinned {
             ClientOrPinned::Shared(c) => c,
             ClientOrPinned::Pinned(c) => c,
         }
+    }
+}
+
+/// Select the HTTP client to use for an already-validated URL.
+///
+/// When `dns_pin` is enabled and the host is a domain, this re-resolves the
+/// domain, re-validates every resolved IP against the SSRF guard, and returns a
+/// client that pins the domain to exactly those IPs. This is the single choke
+/// point every outbound request path must go through so that DNS rebinding
+/// cannot redirect a connection to an internal address *after* validation.
+///
+/// IP-literal hosts cannot rebind, so they use the shared pooled client. When
+/// pinning is disabled the shared client is used and a (documented) rebinding
+/// window remains.
+pub async fn client_for(url: &Url, config: &Config) -> Result<ClientOrPinned> {
+    if config.dns_pin && matches!(url.host(), Some(url::Host::Domain(_))) {
+        Ok(ClientOrPinned::Pinned(build_pinned_client(url, config).await?))
+    } else {
+        Ok(ClientOrPinned::Shared(&HTTP))
     }
 }
 
@@ -235,6 +249,42 @@ mod tests {
             result.unwrap_err(),
             WebSearchError::UrlNotAllowed(_)
         ));
+    }
+
+    // EXPLOIT REGRESSION (#2): every outbound path now selects its client via
+    // `client_for`. An IP-literal host can't rebind, so it uses the shared pool.
+    #[tokio::test]
+    async fn test_client_for_ip_literal_uses_shared() {
+        let config = Config::default();
+        let url = Url::parse("http://1.2.3.4/").unwrap();
+        let c = client_for(&url, &config).await.unwrap();
+        assert!(matches!(c, ClientOrPinned::Shared(_)));
+    }
+
+    // A domain that resolves to an internal address must be rejected at
+    // client-construction time (pinning re-resolves + re-validates), closing the
+    // DNS-rebinding TOCTOU window for HEAD-based tools (web_check_links,
+    // web_fetch_headers) that previously used the shared client directly.
+    #[tokio::test]
+    async fn test_client_for_domain_resolving_internal_is_rejected() {
+        let config = Config::default(); // dns_pin = true, allow_private = false
+        let url = Url::parse("http://localhost/").unwrap();
+        let res = client_for(&url, &config).await;
+        assert!(
+            matches!(res, Err(WebSearchError::UrlNotAllowed(_))),
+            "pinned client should reject a domain resolving to loopback, got {res:?}"
+        );
+    }
+
+    // With pinning enabled, an internal-resolving domain is rejected; with
+    // --allow-private-hosts it is permitted (operator opt-in).
+    #[tokio::test]
+    async fn test_client_for_allow_private_permits_internal_domain() {
+        let mut config = Config::default();
+        config.allow_private_hosts = true;
+        let url = Url::parse("http://localhost/").unwrap();
+        let res = client_for(&url, &config).await;
+        assert!(res.is_ok(), "allow_private should permit localhost pinning");
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use super::{get_str_arg, get_str_array, text_content};
-use crate::client::{fetch_page, HTTP};
+use crate::client::{client_for, fetch_page};
 use crate::config::Config;
 use crate::errors::{Result, WebSearchError};
 use crate::validation::validate_url;
@@ -17,9 +17,12 @@ pub async fn web_fetch_headers(args: Option<&Value>, config: &Config) -> Result<
     let mut current = validate_url(&url, config.allow_private_hosts).await?;
 
     for hop in 0..=config.max_redirects {
+        // Route through the DNS-pinned client so the connection cannot be
+        // redirected to an internal IP after validation (DNS rebinding).
+        let client = client_for(&current, config).await?;
         let resp = tokio::time::timeout(
             config.server.request_timeout,
-            HTTP.head(current.clone()).send(),
+            client.as_ref().head(current.clone()).send(),
         )
         .await
         .map_err(|_| WebSearchError::Timeout(format!("HEAD {current}")))?
@@ -113,9 +116,16 @@ async fn check_one_link(url: &str, config: &Config) -> String {
         Err(e) => return format!("✗ {url} — {e}"),
     };
 
+    // Route through the DNS-pinned client (defeats rebinding between the
+    // validation above and the actual connection below).
+    let client = match client_for(&current, config).await {
+        Ok(c) => c,
+        Err(e) => return format!("✗ {url} — {e}"),
+    };
+
     match tokio::time::timeout(
         config.server.request_timeout,
-        HTTP.head(current.clone()).send(),
+        client.as_ref().head(current.clone()).send(),
     )
     .await
     {
@@ -245,6 +255,35 @@ mod tests {
         let result = web_check_links(Some(&args), &config).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), WebSearchError::InvalidParams(_)));
+    }
+
+    // EXPLOIT REGRESSION (#2): web_check_links must refuse private/metadata
+    // targets. (Validation rejects literal internal IPs up front; the pinned
+    // client closes the rebinding window for domains — see client.rs tests.)
+    #[tokio::test]
+    async fn test_web_check_links_blocks_private_and_metadata() {
+        let config = Config::default();
+        let args = serde_json::json!({"urls": [
+            "http://127.0.0.1:8080/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/",
+        ]});
+        let result = web_check_links(Some(&args), &config).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        // Every line is a failure, and none report a successful HTTP status.
+        assert_eq!(text.matches('✗').count(), 3, "all three must be blocked: {text}");
+        assert!(text.contains("URL not allowed"), "expected SSRF rejection: {text}");
+        assert!(!text.contains('✓'), "no target should have connected: {text}");
+    }
+
+    // EXPLOIT REGRESSION (#2): web_fetch_headers must refuse the cloud metadata
+    // endpoint just like the body-fetching tools.
+    #[tokio::test]
+    async fn test_web_fetch_headers_blocks_metadata() {
+        let config = Config::default();
+        let args = serde_json::json!({"url": "http://169.254.169.254/latest/meta-data/"});
+        let result = web_fetch_headers(Some(&args), &config).await;
+        assert!(matches!(result.unwrap_err(), WebSearchError::UrlNotAllowed(_)));
     }
 
     #[tokio::test]

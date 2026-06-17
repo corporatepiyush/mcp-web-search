@@ -1,6 +1,6 @@
 [package]
 name = "mcp-web-search"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 authors = ["Piyush"]
 description = "High-performance, SSRF-hardened MCP server for web search, scraping, URL discovery, and multi-URL content extraction — a secure Rust alternative to one-search-mcp"
@@ -51,7 +51,6 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # Auth (constant-time bearer token comparison)
-sha2 = "0.10"
 subtle = "2.6"
 
 # Memory allocator — mimalloc for performance

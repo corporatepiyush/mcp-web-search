@@ -3,6 +3,7 @@ use super::{get_opt_bool, get_opt_usize, get_opt_str, get_str_arg, text_content}
 use crate::client::fetch_page;
 use crate::config::Config;
 use crate::errors::Result;
+use futures::StreamExt;
 use quick_xml::events::Event;
 use quick_xml::Reader as XmlReader;
 use serde_json::Value;
@@ -25,19 +26,25 @@ pub async fn web_map(args: Option<&Value>, config: &Config) -> Result<Value> {
     let base_host = start_url.host_str().unwrap_or_default().to_string();
 
     let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<String> = Vec::new();
+    // Each candidate carries whether it still needs a DNS check: exact-host URLs
+    // share the already-validated start host, so they never need re-resolution.
+    let mut candidates: Vec<(String, bool)> = Vec::new();
 
-    let consider = |url: String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
-        if out.len() >= limit {
+    // Cheap, synchronous filtering only (host scope, substring filter, dedup,
+    // limit). DNS resolution is deferred to an async pass below so we never
+    // block the runtime on a synchronous lookup per candidate.
+    let consider = |url: String, candidates: &mut Vec<(String, bool)>, seen: &mut HashSet<String>| {
+        if candidates.len() >= limit {
             return;
         }
-        if !host_allowed(&url, &base_host, include_subdomains) {
-            return;
-        }
-        // Validate URL scheme and resolve DNS. This is defense-in-depth —
-        // fetch_page also validates, but we catch issues here to avoid
-        // leaking reachable IPs in error messages.
-        if crate::validation::validate_url_blocking(&url, config.allow_private_hosts).is_err() {
+        let host = match Url::parse(&url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+        {
+            Some(h) => h,
+            None => return,
+        };
+        if !host_allowed_host(&host, &base_host, include_subdomains) {
             return;
         }
         if let Some(ref f) = filter
@@ -45,8 +52,11 @@ pub async fn web_map(args: Option<&Value>, config: &Config) -> Result<Value> {
         {
             return;
         }
+        // Only cross-host (subdomain) candidates require a DNS check; an exact
+        // host match resolves to the same already-validated start host.
+        let needs_dns = host != base_host;
         if seen.insert(url.clone()) {
-            out.push(url);
+            candidates.push((url, needs_dns));
         }
     };
 
@@ -55,7 +65,7 @@ pub async fn web_map(args: Option<&Value>, config: &Config) -> Result<Value> {
         && let Ok(origin) = start_url.join("/sitemap.xml")
             && let Ok(page) = fetch_page(origin.as_str(), config).await {
                 for loc in parse_sitemap_fast(&page.body) {
-                    consider(loc, &mut out, &mut seen);
+                    consider(loc, &mut candidates, &mut seen);
                 }
             }
 
@@ -63,9 +73,33 @@ pub async fn web_map(args: Option<&Value>, config: &Config) -> Result<Value> {
     if !sitemap_only
         && let Ok(page) = fetch_page(start_url.as_str(), config).await {
             for link in collect_links(&page.body, &page.final_url) {
-                consider(link, &mut out, &mut seen);
+                consider(link, &mut candidates, &mut seen);
             }
         }
+
+    // Defense-in-depth: validate cross-host candidates (scheme + async DNS
+    // against the SSRF guard) concurrently so internal/unreachable subdomains
+    // never appear in the output, without blocking the async worker on DNS.
+    // Same-host candidates skip DNS entirely (the start host is already
+    // validated), so the common case — listing a single site without
+    // includeSubdomains — performs zero extra resolutions and cannot be turned
+    // into a DNS-amplification vector via a large hostile sitemap.
+    let allow_private = config.allow_private_hosts;
+    let concurrency = (*crate::config::CPU_COUNT * 2).max(8);
+    let out: Vec<String> = futures::stream::iter(candidates)
+        .map(|(u, needs_dns)| async move {
+            if !needs_dns {
+                return Some(u);
+            }
+            match crate::validation::validate_url(&u, allow_private).await {
+                Ok(_) => Some(u),
+                Err(_) => None,
+            }
+        })
+        .buffered(concurrency)
+        .filter_map(|x| async move { x })
+        .collect()
+        .await;
 
     Ok(text_content(
         if out.is_empty() {
@@ -77,17 +111,10 @@ pub async fn web_map(args: Option<&Value>, config: &Config) -> Result<Value> {
     ))
 }
 
-fn host_allowed(url: &str, base_host: &str, include_subdomains: bool) -> bool {
-    match Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-    {
-        Some(ref h) if h == base_host => true,
-        Some(ref h) if include_subdomains => {
-            h.ends_with(&format!(".{base_host}")) || h == base_host
-        }
-        _ => false,
-    }
+/// Whether a host is in scope for the map: the exact start host, or (when
+/// enabled) a subdomain of it.
+fn host_allowed_host(host: &str, base_host: &str, include_subdomains: bool) -> bool {
+    host == base_host || (include_subdomains && host.ends_with(&format!(".{base_host}")))
 }
 
 /// Parse `<loc>` elements from a sitemap.xml using a proper streaming XML parser.
@@ -214,29 +241,40 @@ mod tests {
 
     #[test]
     fn test_host_allowed_exact() {
-        assert!(host_allowed("https://a.com/x", "a.com", false));
-        assert!(!host_allowed("https://b.com/x", "a.com", false));
+        assert!(host_allowed_host("a.com", "a.com", false));
+        assert!(!host_allowed_host("b.com", "a.com", false));
+    }
+
+    // The same-host short-circuit (#Important fix): exact-host candidates skip
+    // DNS (needs_dns == false); subdomains still require a resolution.
+    #[test]
+    fn test_host_allowed_host_and_dns_need() {
+        // exact host: in scope, and would not need a DNS re-check
+        assert!(host_allowed_host("a.com", "a.com", false));
+        assert!(host_allowed_host("a.com", "a.com", true));
+        // subdomain: only in scope with includeSubdomains, and needs DNS
+        assert!(!host_allowed_host("sub.a.com", "a.com", false));
+        assert!(host_allowed_host("sub.a.com", "a.com", true));
+        // unrelated host never in scope
+        assert!(!host_allowed_host("evil.com", "a.com", true));
+        // a host that merely ends with the base string but isn't a subdomain
+        assert!(!host_allowed_host("nota.com", "a.com", true));
     }
 
     #[test]
     fn test_host_allowed_subdomain() {
-        assert!(host_allowed("https://sub.a.com/x", "a.com", true));
-        assert!(!host_allowed("https://sub.a.com/x", "a.com", false));
+        assert!(host_allowed_host("sub.a.com", "a.com", true));
+        assert!(!host_allowed_host("sub.a.com", "a.com", false));
     }
 
     #[test]
     fn test_host_allowed_self_with_subdomain() {
-        assert!(host_allowed("https://a.com/x", "a.com", true));
+        assert!(host_allowed_host("a.com", "a.com", true));
     }
 
     #[test]
     fn test_host_allowed_different_tld() {
-        assert!(!host_allowed("https://a.org/x", "a.com", true));
-    }
-
-    #[test]
-    fn test_host_allowed_invalid_url() {
-        assert!(!host_allowed("not a url", "a.com", false));
+        assert!(!host_allowed_host("a.org", "a.com", true));
     }
 
     #[test]
@@ -246,5 +284,19 @@ mod tests {
             .unwrap()
             .block_on(web_map(None, &config));
         assert!(result.is_err());
+    }
+
+    // EXPLOIT REGRESSION (#6): a private/internal start URL is rejected up front
+    // (and the candidate-validation pass that follows is async, not a blocking
+    // DNS call per URL on the runtime).
+    #[tokio::test]
+    async fn test_web_map_rejects_private_start() {
+        let config = Config::default();
+        let args = serde_json::json!({"url": "http://169.254.169.254/"});
+        let result = web_map(Some(&args), &config).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::errors::WebSearchError::UrlNotAllowed(_)
+        ));
     }
 }

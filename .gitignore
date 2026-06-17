@@ -28,3 +28,7 @@ PLAN.md
 PLAN_*.md
 *_PLAN.md
 **/PLAN.md
+
+# Release/security docs kept out of version control
+CHANGELOG.md
+SECURITY.md

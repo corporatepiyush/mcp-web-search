@@ -63,6 +63,20 @@ async fn handle_rpc(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Authenticate before consuming a rate-limit token. Otherwise an
+    // unauthenticated client could drain the shared bucket and deny service to
+    // legitimate (authenticated) callers. This also matches the TCP path, where
+    // the bearer token is checked first.
+    if let Some(ref expected) = state.config.server.auth_token {
+        let presented = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !crate::server::token_matches(presented, expected) {
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    }
+
     if let Some(ref limiter) = state.rate_limiter {
         if !limiter.try_acquire() {
             tracing::warn!("HTTP rate limit exceeded");
@@ -76,16 +90,6 @@ async fn handle_rpc(
                 err.error_data().unwrap_or_default(),
             );
             return (StatusCode::TOO_MANY_REQUESTS, Json(resp)).into_response();
-        }
-    }
-
-    if let Some(ref expected) = state.config.server.auth_token {
-        let presented = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !crate::server::token_matches(presented, expected) {
-            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
 
@@ -226,6 +230,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["result"], Value::Null);
+    }
+
+    // EXPLOIT REGRESSION (#5): auth is checked before the rate limiter, so a
+    // flood of unauthenticated requests cannot drain the shared token bucket and
+    // deny service to authenticated callers.
+    #[tokio::test]
+    async fn test_auth_checked_before_rate_limit() {
+        let mut config = Config::default();
+        config.server.auth_token = Some(Arc::from("secret123"));
+        let config = Arc::new(config);
+        // Capacity 1: a single unauthenticated hit would lock everyone out if
+        // the limiter ran first.
+        let state = HttpState {
+            config,
+            rate_limiter: Some(Arc::new(TokenBucket::new(1.0))),
+        };
+        let app = Router::new()
+            .route("/rpc", post(handle_rpc))
+            .with_state(state);
+
+        let body = serde_json::to_vec(&JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            method: "ping".into(),
+            params: None,
+            id: Some(Value::Number(1.into())),
+        })
+        .unwrap();
+
+        // Hammer with unauthenticated requests — all rejected, none consume a token.
+        for _ in 0..5 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/rpc")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .method(Method::POST)
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // The single rate token is still available for a legitimate caller.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rpc")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer secret123")
+                    .method(Method::POST)
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // And the limiter is genuinely active: the next authenticated request is
+        // throttled (proving the token wasn't already burned by the unauth flood).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/rpc")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer secret123")
+                    .method(Method::POST)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

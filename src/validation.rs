@@ -141,8 +141,9 @@ fn guard_ipv6(ip: Ipv6Addr) -> Result<()> {
     Ok(())
 }
 
-/// Validate a resolved IP address against the SSRF guard. Panics if the
-/// address family is unknown (should not happen with std IpAddr).
+/// Validate an already-resolved IP address against the SSRF guard.
+/// Returns `Ok(())` if the address is public (or `allow_private` is set),
+/// and `WebSearchError::UrlNotAllowed` otherwise.
 pub fn validate_ip(ip: IpAddr, allow_private: bool) -> Result<()> {
     if allow_private {
         return Ok(());

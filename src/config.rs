@@ -171,7 +171,21 @@ impl Config {
                     let raw = if let Some(ref t) = args.auth_token {
                         Some(t.clone())
                     } else if let Some(ref path) = args.auth_token_file {
-                        std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+                        // Fail closed: a misconfigured token file (missing,
+                        // unreadable, or empty) must abort startup, never
+                        // silently launch the server with authentication off.
+                        let contents = std::fs::read_to_string(path).map_err(|e| {
+                            crate::errors::WebSearchError::ConfigError(format!(
+                                "failed to read --auth-token-file '{path}': {e}"
+                            ))
+                        })?;
+                        let token = contents.trim().to_string();
+                        if token.is_empty() {
+                            return Err(crate::errors::WebSearchError::ConfigError(format!(
+                                "--auth-token-file '{path}' is empty; refusing to start with authentication disabled"
+                            )));
+                        }
+                        Some(token)
                     } else {
                         None
                     };
@@ -231,6 +245,99 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal valid `Args` for the default (no-API-key) provider, used to
+    /// exercise `Config::from_args` paths in tests.
+    fn base_args() -> crate::Args {
+        crate::Args {
+            search_provider: SearchProvider::DuckDuckGo,
+            search_api_key: None,
+            search_api_url: None,
+            limit: 10,
+            language: "auto".into(),
+            categories: "general".into(),
+            time_range: String::new(),
+            safe_search: 0,
+            engines: "all".into(),
+            timeout: 10_000,
+            host: "127.0.0.1".into(),
+            port: 3000,
+            http_port: 3001,
+            stdio: false,
+            log_level: "info".into(),
+            request_timeout: 30,
+            max_request_bytes: 1024 * 1024,
+            max_response_bytes: 8 * 1024 * 1024,
+            max_redirects: 5,
+            allow_private_hosts: false,
+            auth_token: None,
+            auth_token_file: None,
+            max_connections: 0,
+            max_extract_urls: 0,
+            max_map_urls: 0,
+            worker_threads: 0,
+            rate_limit: 0.0,
+            dns_pin: true,
+        }
+    }
+
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("mcp-auth-test-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    // EXPLOIT REGRESSION (#3): a missing/unreadable --auth-token-file must abort
+    // startup, never silently boot the server with authentication disabled.
+    #[test]
+    fn test_auth_token_file_missing_fails_closed() {
+        let mut args = base_args();
+        args.auth_token_file = Some("/no/such/path/definitely-missing-token".into());
+        let res = Config::from_args(&args);
+        assert!(
+            matches!(res, Err(crate::errors::WebSearchError::ConfigError(_))),
+            "missing auth-token-file must be a hard ConfigError, got {res:?}"
+        );
+    }
+
+    // An empty token file is also a hard error (otherwise auth is effectively off).
+    #[test]
+    fn test_auth_token_file_empty_fails_closed() {
+        let path = unique_temp_path("empty");
+        std::fs::write(&path, "   \n\t  ").unwrap();
+        let mut args = base_args();
+        args.auth_token_file = Some(path.to_string_lossy().into_owned());
+        let res = Config::from_args(&args);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(res, Err(crate::errors::WebSearchError::ConfigError(_))),
+            "empty auth-token-file must be a hard ConfigError, got {res:?}"
+        );
+    }
+
+    // A valid token file loads (and is trimmed of surrounding whitespace).
+    #[test]
+    fn test_auth_token_file_valid_loads_trimmed() {
+        let path = unique_temp_path("valid");
+        std::fs::write(&path, "  s3cret-token\n").unwrap();
+        let mut args = base_args();
+        args.auth_token_file = Some(path.to_string_lossy().into_owned());
+        let cfg = Config::from_args(&args).expect("valid token file should load");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(cfg.server.auth_token.as_deref(), Some("s3cret-token"));
+    }
+
+    // --auth-token still takes precedence and never touches the filesystem.
+    #[test]
+    fn test_auth_token_inline_takes_precedence() {
+        let mut args = base_args();
+        args.auth_token = Some("inline".into());
+        args.auth_token_file = Some("/no/such/path".into());
+        let cfg = Config::from_args(&args).expect("inline token should win");
+        assert_eq!(cfg.server.auth_token.as_deref(), Some("inline"));
+    }
 
     #[test]
     fn test_provider_parse() {

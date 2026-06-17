@@ -28,6 +28,12 @@ enum LineRead {
 
 /// Read one line from a buffered reader, capping at `max` bytes.
 /// Reuses `buf` and `out` across calls to avoid per-line allocations.
+///
+/// Unlike `read_until`, this consumes the underlying stream incrementally and
+/// aborts the moment the accumulated bytes would exceed `max`. A malicious peer
+/// sending a very long line with no newline therefore cannot force the process
+/// to buffer the whole thing in memory — peak growth is bounded by `max` plus
+/// one fill-buffer chunk.
 async fn read_line_capped<R>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -39,15 +45,65 @@ where
 {
     buf.clear();
     out.clear();
-    let n = reader.read_until(b'\n', buf).await?;
-    if n == 0 {
-        return Ok(LineRead::Eof);
-    }
-    if buf.len() > max {
-        return Ok(LineRead::TooLong);
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(b) => b,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            // EOF. A trailing chunk with no newline is still a complete line.
+            if buf.is_empty() {
+                return Ok(LineRead::Eof);
+            }
+            break;
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                // Including the newline, would this line exceed the cap?
+                if buf.len() + idx + 1 > max {
+                    reader.consume(idx + 1);
+                    return Ok(LineRead::TooLong);
+                }
+                buf.extend_from_slice(&available[..=idx]);
+                reader.consume(idx + 1);
+                break;
+            }
+            None => {
+                let take = available.len();
+                // No newline yet: refuse to grow past the cap rather than
+                // buffering an unbounded line into memory.
+                if buf.len() + take > max {
+                    reader.consume(take);
+                    return Ok(LineRead::TooLong);
+                }
+                buf.extend_from_slice(available);
+                reader.consume(take);
+            }
+        }
     }
     *out = String::from_utf8_lossy(buf).into_owned();
     Ok(LineRead::Line)
+}
+
+/// Read a line subject to both the byte cap and an idle timeout. Returns
+/// `Ok(None)` if no complete line arrives within `idle` — used to drop
+/// slow/stalled TCP peers (slowloris) that would otherwise hold a connection
+/// slot open indefinitely without ever sending a full request.
+async fn read_line_capped_timed<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    out: &mut String,
+    max: usize,
+    idle: std::time::Duration,
+) -> std::io::Result<Option<LineRead>>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    match tokio::time::timeout(idle, read_line_capped(reader, buf, out, max)).await {
+        Ok(res) => res.map(Some),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Constant-time bearer-token check.
@@ -213,14 +269,21 @@ async fn handle_client(
     let mut read_buf = Vec::with_capacity(INITIAL_LINE_CAP);
     let mut response_buf = Vec::with_capacity(INITIAL_RESP_BUF);
     let max = config.server.max_request_bytes;
+    // Idle/read timeout: a peer that opens a connection but never sends a
+    // complete line is dropped instead of holding the slot forever (slowloris).
+    let idle = config.server.request_timeout;
 
     if let Some(ref expected) = config.server.auth_token {
-        match read_line_capped(&mut reader, &mut read_buf, &mut line, max).await {
-            Ok(LineRead::Line) if token_matches(&line, expected) => {
+        match read_line_capped_timed(&mut reader, &mut read_buf, &mut line, max, idle).await {
+            Ok(Some(LineRead::Line)) if token_matches(&line, expected) => {
                 info!("Client authenticated successfully");
             }
-            Ok(LineRead::Eof) => {
+            Ok(Some(LineRead::Eof)) => {
                 warn!("Client disconnected before sending auth token");
+                return Ok(());
+            }
+            Ok(None) => {
+                warn!("Client idle timeout before sending auth token");
                 return Ok(());
             }
             _ => {
@@ -241,16 +304,20 @@ async fn handle_client(
     }
 
     loop {
-        match read_line_capped(&mut reader, &mut read_buf, &mut line, max).await {
-            Ok(LineRead::Eof) => break,
-            Ok(LineRead::Line) => {
+        match read_line_capped_timed(&mut reader, &mut read_buf, &mut line, max, idle).await {
+            Ok(Some(LineRead::Eof)) => break,
+            Ok(Some(LineRead::Line)) => {
                 if line.trim().is_empty() {
                     continue;
                 }
                 process_one_line(&line, &config, &rate_limiter, &mut response_buf, &mut writer).await?;
             }
-            Ok(LineRead::TooLong) => {
+            Ok(Some(LineRead::TooLong)) => {
                 write_oversize_error(&mut response_buf, &mut writer, max).await?;
+                break;
+            }
+            Ok(None) => {
+                warn!("Client idle timeout; closing connection");
                 break;
             }
             Err(e) => {
@@ -623,6 +690,100 @@ mod tests {
         let mut line = String::new();
         let res = read_line_capped(&mut reader, &mut buf, &mut line, 100).await.unwrap();
         assert_eq!(res, LineRead::TooLong);
+    }
+
+    // EXPLOIT REGRESSION (#1): a newline-less payload far larger than `max`
+    // must be rejected as TooLong *without* ever buffering the whole thing.
+    // The old `read_until` implementation would allocate all of `data` before
+    // checking the cap. Here `buf` must never grow past `max`.
+    #[tokio::test]
+    async fn test_read_line_capped_unbounded_line_does_not_buffer_everything() {
+        // 16 MiB with no newline, cap of 64 bytes.
+        let data = vec![b'a'; 16 * 1024 * 1024];
+        let mut reader = tokio::io::BufReader::with_capacity(4096, &data[..]);
+        let mut buf = Vec::new();
+        let mut line = String::new();
+        let res = read_line_capped(&mut reader, &mut buf, &mut line, 64).await.unwrap();
+        assert_eq!(res, LineRead::TooLong);
+        // Bounded memory: we never accumulated more than the cap (plus headroom
+        // for a single fill chunk; with a 4096 buffer it stays tiny).
+        assert!(
+            buf.len() <= 64,
+            "buffer grew to {} bytes — cap was not enforced incrementally",
+            buf.len()
+        );
+    }
+
+    // A line whose newline sits just past the cap is TooLong (boundary check).
+    #[tokio::test]
+    async fn test_read_line_capped_newline_past_cap() {
+        let data = b"aaaaaa\n"; // 6 'a' + newline = 7 bytes
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let mut line = String::new();
+        let res = read_line_capped(&mut reader, &mut buf, &mut line, 6).await.unwrap();
+        assert_eq!(res, LineRead::TooLong);
+    }
+
+    // Reads spanning multiple fill_buf chunks reassemble correctly.
+    #[tokio::test]
+    async fn test_read_line_capped_multi_chunk() {
+        let data = b"hello world this is one line\n";
+        // Tiny BufReader forces several fill_buf/consume cycles per line.
+        let mut reader = tokio::io::BufReader::with_capacity(4, &data[..]);
+        let mut buf = Vec::new();
+        let mut line = String::new();
+        let res = read_line_capped(&mut reader, &mut buf, &mut line, 1024).await.unwrap();
+        assert_eq!(res, LineRead::Line);
+        assert_eq!(line, "hello world this is one line\n");
+    }
+
+    // EXPLOIT REGRESSION (#4 slowloris): a peer that connects and never sends a
+    // complete line must be dropped via the idle timeout, not held forever.
+    #[tokio::test]
+    async fn test_idle_timeout_on_silent_peer() {
+        let (_client, server) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(server);
+        let mut buf = Vec::new();
+        let mut line = String::new();
+        // _client stays open but sends nothing → fill_buf pends → timeout fires.
+        let res = read_line_capped_timed(
+            &mut reader,
+            &mut buf,
+            &mut line,
+            1024,
+            std::time::Duration::from_millis(80),
+        )
+        .await
+        .unwrap();
+        assert!(res.is_none(), "expected idle timeout (None), got {res:?}");
+    }
+
+    // Slowloris variant: a partial line that stalls before its newline is also
+    // dropped rather than holding the connection slot indefinitely.
+    #[tokio::test]
+    async fn test_idle_timeout_on_partial_then_stall() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(server);
+        let mut buf = Vec::new();
+        let mut line = String::new();
+
+        // Send a partial line (no newline) then keep the connection open without
+        // sending more. `client` stays in scope, so the reader sees a stall —
+        // not EOF — and the idle timeout must fire.
+        client.write_all(b"abc").await.unwrap();
+        let res = read_line_capped_timed(
+            &mut reader,
+            &mut buf,
+            &mut line,
+            1024,
+            std::time::Duration::from_millis(80),
+        )
+        .await
+        .unwrap();
+        assert!(res.is_none(), "partial-then-stall should time out, got {res:?}");
+        drop(client);
     }
 
     #[tokio::test]

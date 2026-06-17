@@ -8,8 +8,8 @@ High-performance, SSRF-hardened MCP server for web search, scraping, URL discove
 - **Web Scrape** — fetch and clean page content with optional main-content extraction
 - **Web Map** — site URL discovery via sitemap.xml + in-page link crawling
 - **Web Extract** — mass parallel scrape of 100s of URLs with bounded concurrency
-- **SSRF Guard** — blocks private/meta/link-local addresses by default
-- **Constant-time auth** — bearer token via SHA-256 + `subtle` comparison
+- **SSRF Guard** — blocks private/meta/link-local addresses by default, with DNS-rebinding protection (pinned connections) on every outbound request path
+- **Constant-time auth** — bearer token compared with `subtle` (constant-time), loadable from a file via `--auth-token-file` (fails closed if the file is missing or empty)
 - **CPU-core scaling** — auto-detects core count and scales thread pool, connection limits, and concurrency
 - **Async DNS** — non-blocking DNS resolution via tokio's async resolver
 
