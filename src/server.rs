@@ -427,9 +427,12 @@ async fn process_one_line<W: AsyncWriteExt + Unpin>(
 
 pub async fn process_request(req: &JsonRpcRequest, config: &Config) -> WsResult<Value> {
     match req.method.as_str() {
-        "initialize" => handle_initialize(),
+        "initialize" => handle_initialize(req),
         "tools/list" => handle_tools_list(),
         "tools/call" => handle_tools_call(req, config).await,
+        // Accept and acknowledge the client's desired log level. We advertise the
+        // `logging` capability; this makes the method real rather than a 404.
+        "logging/setLevel" => Ok(json!({})),
         "ping" => Ok(Value::Null),
         method if method.starts_with("notifications/") => {
             tracing::trace!("notification: {method}");
@@ -466,9 +469,32 @@ pub async fn process_request_http(req: &JsonRpcRequest, config: &Config) -> Json
     }
 }
 
-fn handle_initialize() -> WsResult<Value> {
+/// MCP protocol revisions this server can speak, newest first (for `initialize`
+/// version negotiation).
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+/// Newest revision we implement; offered when the client requests an unknown one.
+const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// `instructions` surfaced to the client and appended to the model's system prompt.
+const SERVER_INSTRUCTIONS: &str = "Web search and fetch MCP server. Use `web_search` to find pages \
+(results are ranked by relevance) and `web_scrape`/`web_fetch` for full page content as markdown. \
+These tools reach the live internet. Tool failures (provider errors, timeouts, HTTP 429) are returned \
+with `isError: true` rather than as protocol errors — read the message and, for rate limits, back off \
+and retry.";
+
+fn handle_initialize(req: &JsonRpcRequest) -> WsResult<Value> {
+    // Version negotiation: echo a supported requested revision, else offer latest.
+    let protocol_version = req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(Value::as_str)
+        .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
+        .unwrap_or(LATEST_PROTOCOL_VERSION);
+
     Ok(json!({
-        "protocolVersion": "2024-11-05",
+        "protocolVersion": protocol_version,
         "capabilities": {
             "tools": { "listChanged": false },
             "logging": {}
@@ -476,8 +502,21 @@ fn handle_initialize() -> WsResult<Value> {
         "serverInfo": {
             "name": "mcp-web-search",
             "version": env!("CARGO_PKG_VERSION")
-        }
+        },
+        "instructions": SERVER_INSTRUCTIONS
     }))
+}
+
+/// Wrap a tool execution failure as an MCP `CallToolResult` with `isError: true`
+/// so the model sees the message and can self-correct (e.g. back off on HTTP
+/// 429), instead of receiving an opaque JSON-RPC protocol error. Successful
+/// results are already content-wrapped by the action handlers.
+#[inline]
+fn tool_error(message: &str) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": message }],
+        "isError": true
+    })
 }
 
 fn handle_tools_list() -> WsResult<Value> {
@@ -511,10 +550,21 @@ async fn handle_tools_call(req: &JsonRpcRequest, config: &Config) -> WsResult<Va
         other => Err(WebSearchError::MethodNotFound(other.to_string())),
     };
 
-    if let Err(ref e) = result {
-        error!("Tool '{tool_name}' error: {e}");
+    // Execution failures become isError CallToolResults so the model can read
+    // the message and self-correct; successes (already content-wrapped) get an
+    // explicit isError:false.
+    match result {
+        Ok(mut value) => {
+            if value.get("content").is_some() && value.get("isError").is_none() {
+                value["isError"] = Value::Bool(false);
+            }
+            Ok(value)
+        }
+        Err(e) => {
+            error!("Tool '{tool_name}' error: {e}");
+            Ok(tool_error(&e.to_string()))
+        }
     }
-    result
 }
 
 #[cfg(test)]
@@ -566,10 +616,39 @@ mod tests {
 
     #[test]
     fn test_initialize_response() {
-        let v = handle_initialize().unwrap();
-        assert_eq!(v["protocolVersion"], "2024-11-05");
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "initialize".to_string(),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let v = handle_initialize(&req).unwrap();
+        assert_eq!(v["protocolVersion"], LATEST_PROTOCOL_VERSION);
         assert_eq!(v["serverInfo"]["name"], "mcp-web-search");
         assert_eq!(v["capabilities"]["tools"]["listChanged"], false);
+        assert!(v["instructions"].is_string());
+    }
+
+    #[test]
+    fn test_initialize_version_negotiation() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "initialize".to_string(),
+            params: Some(json!({ "protocolVersion": "2025-03-26" })),
+            id: Some(json!(1)),
+        };
+        assert_eq!(
+            handle_initialize(&req).unwrap()["protocolVersion"],
+            "2025-03-26"
+        );
+    }
+
+    #[test]
+    fn test_tool_error_is_iserror_result() {
+        // Unknown tool inside the dispatch becomes an isError result, not an Err.
+        let v = tool_error("provider returned 429");
+        assert_eq!(v["isError"], true);
+        assert_eq!(v["content"][0]["text"], "provider returned 429");
     }
 
     #[test]

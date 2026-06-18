@@ -16,10 +16,11 @@ fn test_mcp_protocol_initialize() {
         .block_on(mcp_web_search::server::process_request(&req, &config));
     assert!(result.is_ok());
     let v = result.unwrap();
-    assert_eq!(v["protocolVersion"], "2024-11-05");
+    assert_eq!(v["protocolVersion"], "2025-11-25");
     assert_eq!(v["serverInfo"]["name"], "mcp-web-search");
     assert!(v["capabilities"]["tools"]["listChanged"].is_boolean());
     assert!(v["capabilities"]["logging"].is_object());
+    assert!(v["instructions"].is_string());
 }
 
 #[test]
