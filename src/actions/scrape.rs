@@ -110,7 +110,13 @@ fn collapse_whitespace(s: &str) -> String {
             let gt4 = _mm_cmpgt_epi8(biased, _mm_set1_epi8(0x84u8 as i8));
             let in_range = _mm_xor_si128(gt4, ones);
 
-            let ws = _mm_or_si128(eq_space, in_range);
+            // The range [0x09,0x0D] includes 0x0B (vertical tab), but Rust's
+            // `is_ascii_whitespace` (used by the scalar fallback) does NOT treat
+            // VT as whitespace. Exclude it so SIMD and scalar agree byte-for-byte
+            // regardless of input length, chunk alignment, or CPU architecture.
+            let eq_vt = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(0x0Bu8 as i8));
+            let ws_raw = _mm_or_si128(eq_space, in_range);
+            let ws = _mm_andnot_si128(eq_vt, ws_raw); // (!eq_vt) & ws_raw
             let ws_mask = _mm_movemask_epi8(ws) as u16;
 
             if ws_mask == 0 {
@@ -185,11 +191,15 @@ fn collapse_whitespace(s: &str) -> String {
                 continue;
             }
 
-            // All ASCII — detect whitespace
+            // All ASCII — detect whitespace. Exclude 0x0B (vertical tab): the
+            // range [9,13] would include it, but `is_ascii_whitespace` (scalar
+            // path) does not, so we keep both paths byte-for-byte identical.
             let eq_space = vceqq_u8(chunk, vdupq_n_u8(b' '));
             let sub9 = vsubq_u8(chunk, vdupq_n_u8(9));
             let le4 = vcleq_u8(sub9, vdupq_n_u8(4));
-            let ws = vorrq_u8(eq_space, le4);
+            let eq_vt = vceqq_u8(chunk, vdupq_n_u8(0x0B));
+            let ws_raw = vorrq_u8(eq_space, le4);
+            let ws = vbicq_u8(ws_raw, eq_vt); // ws_raw AND NOT eq_vt
 
             if vmaxvq_u8(ws) == 0 {
                 // No whitespace — bulk copy
@@ -270,9 +280,9 @@ fn cleanup_md(md: &mut String) {
             }
         }
     }
-    let trimmed = out.trim().to_string();
+    // Trim into the output buffer directly — no intermediate allocation.
     md.clear();
-    md.push_str(&trimmed);
+    md.push_str(out.trim());
 }
 
 /// Walk child nodes of an element, dispatching elements to `walk_element`
@@ -487,8 +497,13 @@ fn walk_element(el: ElementRef, md: &mut String, list_depth: &mut u32) {
 /// Parse HTML and produce markdown by walking scraper's ego-tree (arena-allocated DOM).
 /// Avoids the second HTML parse that htmd requires, but produces simpler formatting.
 pub fn dom_to_markdown(html: &str) -> String {
-    let doc = Html::parse_document(html);
-    let mut md = String::with_capacity(html.len().max(64));
+    dom_to_markdown_doc(&Html::parse_document(html), html.len())
+}
+
+/// Markdown conversion over an already-parsed document — lets callers that need
+/// several formats parse the HTML exactly once.
+fn dom_to_markdown_doc(doc: &Html, cap_hint: usize) -> String {
+    let mut md = String::with_capacity(cap_hint.max(64));
     let mut list_depth = 0u32;
     for child in doc.tree.root().children() {
         if let Some(el) = ElementRef::wrap(child) {
@@ -502,8 +517,12 @@ pub fn dom_to_markdown(html: &str) -> String {
 /// Parse HTML, isolate main/article content, convert to markdown in one pass.
 /// Falls back to the full document if no main element is found.
 pub fn main_to_markdown(html: &str) -> String {
-    let doc = Html::parse_document(html);
-    let mut md = String::with_capacity(html.len().max(64));
+    main_to_markdown_doc(&Html::parse_document(html), html.len())
+}
+
+/// Main-content markdown over an already-parsed document (see `dom_to_markdown_doc`).
+fn main_to_markdown_doc(doc: &Html, cap_hint: usize) -> String {
+    let mut md = String::with_capacity(cap_hint.max(64));
     let mut list_depth = 0u32;
     if let Some(main) = doc.select(&MAIN_SEL).next() {
         walk_element(main, &mut md, &mut list_depth);
@@ -528,9 +547,12 @@ pub fn html_to_text(html: &str) -> String {
             text_walk_element(el, &mut out);
         }
     }
-    let trimmed = out.trim().to_string();
-    out.clear();
-    out.push_str(&trimmed);
+    // Trim in place (no second String allocation): drop the trailing whitespace,
+    // then drain the leading whitespace.
+    let end = out.trim_end().len();
+    out.truncate(end);
+    let start = out.len() - out.trim_start().len();
+    out.drain(..start);
     out
 }
 
@@ -591,34 +613,65 @@ pub async fn web_scrape(args: Option<&Value>, config: &Config) -> Result<Value> 
 
     // All CPU-heavy work (HTML parse, DOM query, markdown convert) runs
     // on the blocking pool so async workers stay free for IO.
-    let text = tokio::task::spawn_blocking(move || -> Result<String> {
+    let text = tokio::task::spawn_blocking(move || -> String {
+        // Parse the HTML at most once, shared across every requested format.
+        let needs_dom = formats.iter().any(|f| {
+            matches!(f.as_str(), "markdown" | "extract" | "links")
+                || (f == "html" && only_main)
+        });
+        let doc = needs_dom.then(|| Html::parse_document(&body));
+
+        // "html" (full-doc) and "rawHtml" both emit the original body. Move it
+        // into the last such section and clone only for earlier ones — except
+        // when "html"+onlyMain also needs `body` as a borrow, in which case we
+        // keep it and clone.
+        let is_raw_passthrough =
+            |f: &str| f == "rawHtml" || (f == "html" && !only_main);
+        let needs_body_borrow = only_main && formats.iter().any(|f| f == "html");
+        let last_raw = if needs_body_borrow {
+            None
+        } else {
+            formats
+                .iter()
+                .rposition(|f| is_raw_passthrough(f))
+        };
+
+        let mut body_opt = Some(body);
         let mut sections: Vec<String> = Vec::with_capacity(formats.len());
-        for fmt in &formats {
+        for (idx, fmt) in formats.iter().enumerate() {
             match fmt.as_str() {
                 "markdown" | "extract" => {
-                    let md = if only_main {
-                        main_to_markdown(&body)
+                    let doc = doc.as_ref().expect("dom parsed");
+                    let hint = body_opt.as_ref().map_or(0, String::len);
+                    sections.push(if only_main {
+                        main_to_markdown_doc(doc, hint)
                     } else {
-                        dom_to_markdown(&body)
-                    };
-                    sections.push(md);
+                        dom_to_markdown_doc(doc, hint)
+                    });
                 }
-                "html" => {
-                    if only_main {
-                        sections.push(extract_main(&body));
+                "html" if only_main => {
+                    let doc = doc.as_ref().expect("dom parsed");
+                    let fallback = body_opt.as_deref().unwrap_or("");
+                    sections.push(extract_main_doc(doc, fallback));
+                }
+                "html" | "rawHtml" => {
+                    if Some(idx) == last_raw {
+                        sections.push(body_opt.take().unwrap_or_default());
                     } else {
-                        sections.push(body.clone());
+                        sections.push(body_opt.as_deref().unwrap_or("").to_string());
                     }
                 }
-                "rawHtml" => sections.push(body.clone()),
-                "links" => sections.push(collect_links(&body, &final_url).join("\n")),
+                "links" => {
+                    let doc = doc.as_ref().expect("dom parsed");
+                    sections.push(collect_links_doc(doc, &final_url).join("\n"));
+                }
                 _ => unreachable!(), // validated above
             }
         }
-        Ok(sections.join("\n\n"))
+        sections.join("\n\n")
     })
     .await
-    .map_err(|e| WebSearchError::ProviderError(format!("parse task failed: {e}")))??;
+    .map_err(|e| WebSearchError::ProviderError(format!("parse task failed: {e}")))?;
 
     Ok(text_content(if text.is_empty() {
         "No content found"
@@ -685,15 +738,23 @@ pub async fn extract_main_markdown(url: &str, config: &Config) -> Result<String>
 }
 
 pub fn extract_main(html: &str) -> String {
-    let doc = Html::parse_document(html);
+    extract_main_doc(&Html::parse_document(html), html)
+}
+
+/// Isolate main content from an already-parsed document, falling back to
+/// `fallback` (the original HTML) when no main element exists.
+fn extract_main_doc(doc: &Html, fallback: &str) -> String {
     if let Some(main) = doc.select(&MAIN_SEL).next() {
         return main.html();
     }
-    html.to_string()
+    fallback.to_string()
 }
 
 pub fn collect_links(html: &str, base: &Url) -> Vec<String> {
-    let doc = Html::parse_document(html);
+    collect_links_doc(&Html::parse_document(html), base)
+}
+
+fn collect_links_doc(doc: &Html, base: &Url) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for el in doc.select(&A_HREF) {
@@ -701,8 +762,8 @@ pub fn collect_links(html: &str, base: &Url) -> Vec<String> {
             && let Ok(abs) = base.join(href)
         {
             let s = abs.to_string();
-            if !seen.contains(&s) {
-                seen.insert(s.clone());
+            // `insert` returns false if already present — one hash probe, not two.
+            if seen.insert(s.clone()) {
                 out.push(s);
             }
         }
@@ -1704,6 +1765,77 @@ mod tests {
     #[test]
     fn test_collapse_whitespace_tabs() {
         assert_eq!(collapse_whitespace("hello\tworld"), "hello world");
+    }
+
+    /// Reference implementation: collapse runs of ASCII whitespace (per Rust's
+    /// `is_ascii_whitespace`, which excludes U+000B) to a single space. The
+    /// active `collapse_whitespace` (SIMD on x86_64/aarch64) must match this
+    /// byte-for-byte on every input.
+    fn reference_collapse(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut prev_was_space = false;
+        for ch in s.chars() {
+            if ch.is_ascii() && (ch as u8).is_ascii_whitespace() {
+                if !prev_was_space {
+                    out.push(' ');
+                    prev_was_space = true;
+                }
+            } else {
+                out.push(ch);
+                prev_was_space = false;
+            }
+        }
+        out
+    }
+
+    // EXPLOIT/CORRECTNESS REGRESSION: U+000B (vertical tab) must NOT be treated
+    // as whitespace by the SIMD path (it isn't by the scalar path). Strings here
+    // are long enough to exercise the 16-byte SIMD chunk loop.
+    #[test]
+    fn test_collapse_whitespace_vertical_tab_matches_scalar() {
+        let cases = [
+            "abcdefghijklmnop\u{0B}qrstuvwxyz0123",
+            "\u{0B}\u{0B}\u{0B}aaaaaaaaaaaaaaaaaaaa",
+            "word\u{0B}word and more text here to exceed sixteen bytes",
+            "trailing vertical tab at end of a long ascii string here\u{0B}",
+        ];
+        for s in cases {
+            assert_eq!(
+                collapse_whitespace(s),
+                reference_collapse(s),
+                "SIMD/scalar divergence on vertical tab for {s:?}"
+            );
+            // VT is preserved, not collapsed to a space.
+            assert!(collapse_whitespace(s).contains('\u{0B}'), "VT dropped: {s:?}");
+        }
+    }
+
+    // Differential fuzz: the active collapse_whitespace (SIMD on this arch) must
+    // equal the scalar reference for randomized inputs that include control
+    // chars, all ASCII whitespace, multibyte UTF-8, and lengths that straddle
+    // the 16-byte SIMD boundary.
+    #[test]
+    fn test_collapse_whitespace_differential_fuzz() {
+        use rand::Rng;
+        // Charset deliberately includes the whole [0x09,0x0D] control range
+        // (tab, LF, VT, FF, CR), space, ASCII text, and some multibyte chars.
+        let charset: &[&str] = &[
+            " ", "\t", "\n", "\u{0B}", "\u{0C}", "\r", "a", "Z", "0", "!",
+            "é", "中", "🌍",
+        ];
+        let mut rng = rand::rng();
+        for _ in 0..5000 {
+            let len = rng.random_range(0..40);
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push_str(charset[rng.random_range(0..charset.len())]);
+            }
+            assert_eq!(
+                collapse_whitespace(&s),
+                reference_collapse(&s),
+                "SIMD/scalar divergence on {s:?}"
+            );
+        }
     }
 
     // ─── text_skip_element tests ───────────────────────────────────────

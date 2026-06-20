@@ -12,6 +12,7 @@ use std::time::Duration;
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
+    timeout::TimeoutLayer,
 };
 use tracing::debug;
 
@@ -31,6 +32,11 @@ pub async fn create_http_server(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let host = config.server.host.clone();
     let max_body = config.server.max_request_bytes;
+    // Transport timeout for the whole request (incl. slow body reads). Set a bit
+    // above the handler's own request_timeout so a normal handler timeout still
+    // returns the graceful JSON-RPC/isError body; this layer is the backstop for
+    // clients that stall while streaming the request (slowloris on the body).
+    let request_timeout = config.server.request_timeout + Duration::from_secs(5);
     let rate_limiter = if config.server.rate_limit > 0.0 {
         Some(Arc::new(TokenBucket::new(config.server.rate_limit)))
     } else {
@@ -46,6 +52,10 @@ pub async fn create_http_server(
     let app = Router::new()
         .route("/rpc", post(handle_rpc))
         .route("/health", get(handle_health))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        ))
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(cors)
         .with_state(state);

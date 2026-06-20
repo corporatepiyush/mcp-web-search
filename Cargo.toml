@@ -1,6 +1,6 @@
 [package]
 name = "mcp-web-search"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 authors = ["Piyush"]
 description = "High-performance, SSRF-hardened MCP server for web search, scraping, URL discovery, and multi-URL content extraction — a secure Rust alternative to one-search-mcp"

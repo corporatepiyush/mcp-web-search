@@ -83,9 +83,17 @@ fn check_addrs(
     let mut saw_any = false;
     for addr in addrs {
         saw_any = true;
-        match addr.ip() {
-            IpAddr::V4(ip) => guard_ipv4(ip)?,
-            IpAddr::V6(ip) => guard_ipv6(ip)?,
+        let guarded = match addr.ip() {
+            IpAddr::V4(ip) => guard_ipv4(ip),
+            IpAddr::V6(ip) => guard_ipv6(ip),
+        };
+        if guarded.is_err() {
+            // Do not echo the resolved IP for a domain: that would turn the
+            // tool into an oracle for internal network topology. Report only
+            // the domain (which the caller already supplied).
+            return Err(WebSearchError::UrlNotAllowed(format!(
+                "host '{domain}' resolves to a non-public address"
+            )));
         }
     }
     if !saw_any {
@@ -258,6 +266,19 @@ mod tests {
         assert!(is_safe_host("https://example.com"));
         assert!(!is_safe_host("http://127.0.0.1/"));
         assert!(!is_safe_host("http://169.254.169.254/"));
+    }
+
+    // REGRESSION (#10): when a domain resolves to a blocked address, the error
+    // must NOT echo the resolved IP (it would be an internal-topology oracle).
+    #[test]
+    fn check_addrs_domain_failure_hides_resolved_ip() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 0);
+        let err = check_addrs(std::iter::once(addr), "internal.example.com").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("non-public"), "got: {msg}");
+        assert!(msg.contains("internal.example.com"), "got: {msg}");
+        assert!(!msg.contains("10.0.0.5"), "leaked resolved IP: {msg}");
     }
 
     #[test]

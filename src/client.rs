@@ -201,7 +201,12 @@ async fn build_pinned_client(url: &Url, config: &Config) -> Result<reqwest::Clie
         .collect();
 
     for addr in &addrs {
-        crate::validation::validate_ip(addr.ip(), config.allow_private_hosts)?;
+        if crate::validation::validate_ip(addr.ip(), config.allow_private_hosts).is_err() {
+            // Generic message — don't leak the resolved internal IP of a domain.
+            return Err(WebSearchError::UrlNotAllowed(format!(
+                "host '{domain}' resolves to a non-public address"
+            )));
+        }
     }
 
     let cpus = num_cpus::get();

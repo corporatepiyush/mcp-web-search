@@ -394,20 +394,10 @@ async fn process_one_line<W: AsyncWriteExt + Unpin>(
                     };
                     (resp, is_notif)
                 }
-                Err(_) => {
-                    let err_msg = format!(
-                        "request timed out after {}s",
-                        config.server.request_timeout.as_secs()
-                    );
-                    (
-                        JsonRpcResponse::error(
-                            req.id,
-                            WebSearchError::Timeout(String::new()).error_code(),
-                            err_msg,
-                        ),
-                        is_notif,
-                    )
-                }
+                Err(_) => (
+                    timeout_response(&req, config.server.request_timeout.as_secs()),
+                    is_notif,
+                ),
             }
         }
         Err(e) => (parse_error(e), false),
@@ -458,14 +448,7 @@ pub async fn process_request_http(req: &JsonRpcRequest, config: &Config) -> Json
                 JsonRpcResponse::error(req.id.clone(), e.error_code(), e.to_string())
             }
         }
-        Err(_) => JsonRpcResponse::error(
-            req.id.clone(),
-            WebSearchError::Timeout(String::new()).error_code(),
-            format!(
-                "request timed out after {}s",
-                config.server.request_timeout.as_secs()
-            ),
-        ),
+        Err(_) => timeout_response(req, config.server.request_timeout.as_secs()),
     }
 }
 
@@ -517,6 +500,23 @@ fn tool_error(message: &str) -> Value {
         "content": [{ "type": "text", "text": message }],
         "isError": true
     })
+}
+
+/// Build the response for a request that exceeded the server timeout. For
+/// `tools/call` this is a `CallToolResult` with `isError: true` so the model can
+/// read it and back off — consistent with how tool-internal timeouts are
+/// surfaced. Other methods get a JSON-RPC timeout error.
+fn timeout_response(req: &JsonRpcRequest, timeout_secs: u64) -> JsonRpcResponse {
+    let msg = format!("request timed out after {timeout_secs}s");
+    if req.method == "tools/call" {
+        JsonRpcResponse::success(req.id.clone(), tool_error(&msg))
+    } else {
+        JsonRpcResponse::error(
+            req.id.clone(),
+            WebSearchError::Timeout(String::new()).error_code(),
+            msg,
+        )
+    }
 }
 
 fn handle_tools_list() -> WsResult<Value> {
@@ -897,5 +897,44 @@ mod tests {
     fn test_timeout_error_code() {
         let err = WebSearchError::Timeout("request timed out".into());
         assert_eq!(err.error_code(), -32005);
+    }
+
+    // REGRESSION (#8): a tools/call that hits the request-level timeout is a
+    // CallToolResult with isError:true (model-readable), not a protocol error.
+    #[test]
+    fn test_timeout_response_tools_call_is_iserror() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            method: "tools/call".into(),
+            params: None,
+            id: Some(Value::Number(1.into())),
+        };
+        let resp = timeout_response(&req, 30);
+        assert!(resp.error.is_none(), "should not be a protocol error");
+        let result = resp.result.expect("result present");
+        assert_eq!(result["isError"], Value::Bool(true));
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("timed out")
+        );
+    }
+
+    // Non-tool methods keep the JSON-RPC protocol timeout error.
+    #[test]
+    fn test_timeout_response_non_tool_is_protocol_error() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            method: "ping".into(),
+            params: None,
+            id: Some(Value::Number(1.into())),
+        };
+        let resp = timeout_response(&req, 30);
+        assert!(resp.result.is_none());
+        assert_eq!(
+            resp.error.unwrap().code,
+            WebSearchError::Timeout(String::new()).error_code()
+        );
     }
 }

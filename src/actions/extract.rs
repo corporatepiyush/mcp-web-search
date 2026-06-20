@@ -3,17 +3,17 @@ use super::{get_str_array, text_content};
 use crate::client::fetch_page;
 use crate::config::Config;
 use crate::errors::{Result, WebSearchError};
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::StreamExt;
 use serde_json::Value;
-use std::sync::Arc;
 
 /// `web_extract` — fetch and clean content from many URLs, concurrently
 /// with bounded parallelism. Each URL passes the SSRF guard; failures are
 /// reported per-URL without failing the whole call.
 ///
-/// The semaphore gates **only the IO phase** (HTTP fetch). Once a page body
-/// is received, the permit is released so another fetch can start while
-/// CPU-heavy HTML parsing runs on the blocking pool.
+/// Concurrency is bounded over the **whole** fetch+parse pipeline (not just the
+/// IO phase), so at most `concurrency` page bodies are resident at once. This
+/// caps peak memory — bodies can be up to `max_response_bytes` each, and an
+/// IO-only bound would let every fetched body pile up waiting for the CPU phase.
 pub async fn web_extract(args: Option<&Value>, config: &Config) -> Result<Value> {
     let urls = get_str_array(args, "urls")
         .filter(|u| !u.is_empty())
@@ -27,33 +27,15 @@ pub async fn web_extract(args: Option<&Value>, config: &Config) -> Result<Value>
         )));
     }
 
-    let cpus = num_cpus::get();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(cpus * 2));
-
-    let mut sections = Vec::with_capacity(urls.len());
-    let mut futures = FuturesUnordered::new();
-
-    for url in &urls {
-        let sem = Arc::clone(&semaphore);
-        let url = url.clone();
-        futures.push(async move {
-            // IO phase — gated by semaphore
-            let _permit = sem.acquire().await.expect("semaphore closed");
-            let io_result = fetch_page(&url, config).await;
-            drop(_permit); // release before CPU phase
-
-            match io_result {
+    let concurrency = (num_cpus::get() * 2).max(4);
+    let sections: Vec<String> = futures::stream::iter(urls.iter().cloned())
+        .map(|url| async move {
+            match fetch_page(&url, config).await {
                 Ok(page) => {
                     let body = page.body;
-                    match tokio::task::spawn_blocking(move || -> crate::errors::Result<String> {
-                        Ok(scrape::main_to_markdown(&body))
-                    })
-                    .await
+                    match tokio::task::spawn_blocking(move || scrape::main_to_markdown(&body)).await
                     {
-                        Ok(Ok(md)) => format!("## Content from {url}\n\n{md}"),
-                        Ok(Err(e)) => {
-                            format!("## Failed to extract from {url}\n\nError: {e}")
-                        }
+                        Ok(md) => format!("## Content from {url}\n\n{md}"),
                         Err(_) => {
                             format!("## Failed to extract from {url}\n\nError: parse task panicked")
                         }
@@ -61,12 +43,10 @@ pub async fn web_extract(args: Option<&Value>, config: &Config) -> Result<Value>
                 }
                 Err(e) => format!("## Failed to extract from {url}\n\nError: {e}"),
             }
-        });
-    }
-
-    while let Some(result) = futures.next().await {
-        sections.push(result);
-    }
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
 
     Ok(text_content(&sections.join("\n\n---\n\n")))
 }
