@@ -87,6 +87,12 @@ pub struct ServerConfig {
     pub auth_token: Option<Arc<str>>,
     pub max_connections: usize,
     pub rate_limit: f64,
+    /// PEM certificate chain for serving the HTTP transport over TLS (HTTPS).
+    /// `None` (the default) keeps the HTTP transport plaintext. Engaged only
+    /// when both `tls_cert` and `tls_key` are set.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key matching `tls_cert`.
+    pub tls_key: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +140,25 @@ impl Config {
             return Err(crate::errors::WebSearchError::ConfigError(format!(
                 "provider '{provider}' requires SEARCH_API_URL (--search-api-url) set to the {hint}"
             )));
+        }
+
+        // TLS cert/key for the HTTP transport (CLI flags or MCP_TLS_CERT/KEY env,
+        // resolved by clap). Both must be supplied together.
+        let tls_cert = args
+            .tls_cert
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        let tls_key = args
+            .tls_key
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        if tls_cert.is_some() != tls_key.is_some() {
+            return Err(crate::errors::WebSearchError::ConfigError(
+                "--tls-cert and --tls-key must be provided together (or both omitted for plaintext HTTP)"
+                    .to_string(),
+            ));
         }
 
         let cpus = *CPU_COUNT;
@@ -197,6 +222,8 @@ impl Config {
                     (cpus * 256).max(64)
                 },
                 rate_limit: args.rate_limit.max(0.0),
+                tls_cert,
+                tls_key,
             },
             max_response_bytes: args.max_response_bytes,
             max_redirects: args.max_redirects,
@@ -233,6 +260,8 @@ impl Default for Config {
                 auth_token: None,
                 max_connections: (cpus * 256).max(64),
                 rate_limit: 0.0,
+                tls_cert: None,
+                tls_key: None,
             },
             max_response_bytes: 8 * 1024 * 1024,
             max_redirects: 5,
@@ -278,6 +307,8 @@ mod tests {
             worker_threads: 0,
             rate_limit: 0.0,
             dns_pin: true,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 

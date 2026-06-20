@@ -31,6 +31,8 @@ pub async fn create_http_server(
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let host = config.server.host.clone();
+    let tls_cert = config.server.tls_cert.clone();
+    let tls_key = config.server.tls_key.clone();
     let max_body = config.server.max_request_bytes;
     // Transport timeout for the whole request (incl. slow body reads). Set a bit
     // above the handler's own request_timeout so a normal handler timeout still
@@ -61,11 +63,31 @@ pub async fn create_http_server(
         .with_state(state);
 
     let addr = format!("{host}:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("HTTP server listening on {addr}");
 
-    axum::serve(listener, app).await?;
+    // Serve over TLS (HTTPS) when a cert+key are configured, otherwise plaintext.
+    // `config.rs` guarantees the two are set together.
+    if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+        let tls = crate::tls::server_config(&cert, &key).await?;
+        let socket_addr = resolve_addr(&addr)?;
+        tracing::info!("HTTPS server listening on {socket_addr} (TLS)");
+        axum_server::bind_rustls(socket_addr, tls)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        tracing::info!("HTTP server listening on {addr}");
+        axum::serve(listener, app).await?;
+    }
     Ok(())
+}
+
+/// Resolve a `host:port` string to a single `SocketAddr` for `axum_server`,
+/// which binds an address rather than an already-bound listener.
+fn resolve_addr(addr: &str) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs()?
+        .next()
+        .ok_or_else(|| format!("could not resolve bind address '{addr}'").into())
 }
 
 async fn handle_rpc(

@@ -28,6 +28,10 @@ fn main() -> Result<()> {
 async fn inner_main(args: Args) -> Result<()> {
     init_tracing(&args.log_level)?;
 
+    // Install the rustls `ring` crypto provider as the process default up front
+    // (idempotent) so the HTTPS transport can build its TLS config. See src/tls.rs.
+    mcp_web_search::tls::ensure_crypto_provider();
+
     info!(
         name = "mcp-web-search",
         version = env!("CARGO_PKG_VERSION"),

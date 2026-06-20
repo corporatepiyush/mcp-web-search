@@ -34,7 +34,19 @@ mcp-web-search --http-port 3001
 
 # With auth
 mcp-web-search --auth-token "my-secret-token"
+
+# Serve the HTTP transport over TLS (HTTPS)
+mcp-web-search --http-port 3001 --tls-cert ./cert.pem --tls-key ./key.pem
 ```
+
+### TLS (HTTPS)
+
+The HTTP transport can be served over TLS (rustls, `ring` provider — the same
+backend as the reqwest search client). Provide a PEM certificate chain and
+private key via `--tls-cert`/`--tls-key` or the `MCP_TLS_CERT`/`MCP_TLS_KEY`
+environment variables and the HTTP server speaks HTTPS instead of plaintext. The
+two must be supplied together or startup is refused; when neither is set the HTTP
+transport stays plaintext (the default). The TCP transport is unaffected.
 
 ### Environment Variables
 
@@ -44,6 +56,8 @@ mcp-web-search --auth-token "my-secret-token"
 | `SEARCH_API_KEY` | — | API key for providers that require one |
 | `SEARCH_API_URL` | — | API URL (SearXNG, Google) |
 | `AUTH_TOKEN` | — | Bearer token for authentication |
+| `MCP_TLS_CERT` | — | PEM certificate chain to serve HTTP over TLS |
+| `MCP_TLS_KEY` | — | PEM private key matching `MCP_TLS_CERT` |
 
 ## MCP Compliance
 

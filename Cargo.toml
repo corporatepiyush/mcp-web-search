@@ -1,6 +1,6 @@
 [package]
 name = "mcp-web-search"
-version = "2.0.1"
+version = "2.1.0"
 edition = "2024"
 authors = ["Piyush"]
 description = "High-performance, SSRF-hardened MCP server for web search, scraping, URL discovery, and multi-URL content extraction — a secure Rust alternative to one-search-mcp"
@@ -18,6 +18,11 @@ tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "io-util", 
 
 # HTTP server — axum 0.8 latest patch
 axum = "0.8"
+# Server-side TLS (HTTPS) for the axum HTTP transport. `tls-rustls-no-provider`
+# keeps rustls on the process default `ring` crypto provider (installed in
+# src/tls.rs) — consistent with the reqwest rustls client, no OpenSSL/aws-lc.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 hyper = { version = "1.6", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "limit", "timeout", "set-header"] }

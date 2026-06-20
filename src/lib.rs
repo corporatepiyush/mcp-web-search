@@ -7,6 +7,7 @@ pub mod protocol;
 pub mod providers;
 pub mod ratelimit;
 pub mod server;
+pub mod tls;
 pub mod tools;
 pub mod validation;
 
@@ -105,4 +106,10 @@ pub struct Args {
 
     #[arg(long, default_value_t = true, help = "Pin resolved DNS to prevent rebinding attacks (adds ~10ms per request). Use --no-dns-pin to disable")]
     pub dns_pin: bool,
+
+    #[arg(long, env = "MCP_TLS_CERT", help = "PEM certificate chain to serve the HTTP transport over TLS (HTTPS). Requires --tls-key; plaintext when unset")]
+    pub tls_cert: Option<String>,
+
+    #[arg(long, env = "MCP_TLS_KEY", help = "PEM private key matching --tls-cert")]
+    pub tls_key: Option<String>,
 }
