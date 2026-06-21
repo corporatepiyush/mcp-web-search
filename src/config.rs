@@ -5,6 +5,32 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+/// Configuration for the optional headless browser (Chrome/Chromium via CDP).
+#[derive(Debug, Clone)]
+pub struct BrowserSettings {
+    /// When true all browser tools return a descriptive error without launching Chrome.
+    pub disabled: bool,
+    /// Maximum number of simultaneously open browser pages.
+    /// Each page uses roughly 50–200 MB of RAM; tune to your machine.
+    pub max_pages: usize,
+    /// How long to wait for a page to navigate before timing out.
+    pub nav_timeout: Duration,
+    /// Path to the Chrome/Chromium binary. `None` = auto-detect from PATH.
+    pub chrome_path: Option<std::path::PathBuf>,
+}
+
+impl Default for BrowserSettings {
+    fn default() -> Self {
+        let cpus = *CPU_COUNT;
+        BrowserSettings {
+            disabled: false,
+            max_pages: (cpus * 2).max(4),
+            nav_timeout: Duration::from_secs(30),
+            chrome_path: None,
+        }
+    }
+}
+
 /// Number of logical CPUs detected at startup. Used as the scaling basis for
 /// connection limits, concurrency bounds, and HTTP pool sizing.
 pub static CPU_COUNT: LazyLock<usize> = LazyLock::new(num_cpus::get);
@@ -117,6 +143,7 @@ pub struct Config {
     pub max_redirects: usize,
     pub allow_private_hosts: bool,
     pub dns_pin: bool,
+    pub browser: BrowserSettings,
 }
 
 impl Config {
@@ -229,6 +256,20 @@ impl Config {
             max_redirects: args.max_redirects,
             allow_private_hosts: args.allow_private_hosts,
             dns_pin: args.dns_pin,
+            browser: BrowserSettings {
+                disabled: args.browser_disable,
+                max_pages: if args.browser_max_pages > 0 {
+                    args.browser_max_pages
+                } else {
+                    (cpus * 2).max(4)
+                },
+                nav_timeout: Duration::from_millis(args.browser_nav_timeout_ms),
+                chrome_path: args
+                    .browser_path
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from),
+            },
         })
     }
 }
@@ -267,6 +308,7 @@ impl Default for Config {
             max_redirects: 5,
             allow_private_hosts: false,
             dns_pin: true,
+            browser: BrowserSettings::default(),
         }
     }
 }
@@ -309,6 +351,10 @@ mod tests {
             dns_pin: true,
             tls_cert: None,
             tls_key: None,
+            browser_path: None,
+            browser_max_pages: 0,
+            browser_nav_timeout_ms: 30_000,
+            browser_disable: false,
         }
     }
 

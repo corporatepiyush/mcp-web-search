@@ -547,6 +547,8 @@ async fn handle_tools_call(req: &JsonRpcRequest, config: &Config) -> WsResult<Va
         "web_search_scrape" => actions::search::web_search_scrape(tool_args, config).await,
         "web_sitemap" => actions::fetch::web_sitemap(tool_args, config).await,
         "web_check_links" => actions::fetch::web_check_links(tool_args, config).await,
+        "browser_scrape" => actions::browser::browser_scrape(tool_args, config).await,
+        "browser_screenshot" => actions::browser::browser_screenshot(tool_args, config).await,
         other => Err(WebSearchError::MethodNotFound(other.to_string())),
     };
 

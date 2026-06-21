@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod browser;
 pub mod client;
 pub mod config;
 pub mod errors;
@@ -112,4 +113,16 @@ pub struct Args {
 
     #[arg(long, env = "MCP_TLS_KEY", help = "PEM private key matching --tls-cert")]
     pub tls_key: Option<String>,
+
+    #[arg(long, env = "BROWSER_PATH", help = "Path to Chrome/Chromium binary for headless browser tools (auto-detected from PATH when unset)")]
+    pub browser_path: Option<String>,
+
+    #[arg(long, env = "BROWSER_MAX_PAGES", default_value_t = 0, help = "Max concurrent browser pages (0 = 2×num_cpus, min 4). Each page uses ~50-200 MB RAM")]
+    pub browser_max_pages: usize,
+
+    #[arg(long, env = "BROWSER_NAV_TIMEOUT_MS", default_value_t = 30_000, help = "Per-navigation timeout for browser tools in milliseconds")]
+    pub browser_nav_timeout_ms: u64,
+
+    #[arg(long, env = "BROWSER_DISABLE", help = "Disable headless browser tools entirely; browser_scrape and browser_screenshot return errors")]
+    pub browser_disable: bool,
 }

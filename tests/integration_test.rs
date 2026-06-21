@@ -343,6 +343,12 @@ fn test_auth_token_from_file() {
         worker_threads: 0,
         rate_limit: 0.0,
         dns_pin: true,
+        tls_cert: None,
+        tls_key: None,
+        browser_path: None,
+        browser_max_pages: 0,
+        browser_nav_timeout_ms: 30_000,
+        browser_disable: false,
     };
     let cfg = mcp_web_search::config::Config::from_args(&args).unwrap();
     assert_eq!(
@@ -449,6 +455,12 @@ fn test_config_provider_validation() {
         worker_threads: 0,
         rate_limit: 0.0,
         dns_pin: true,
+        tls_cert: None,
+        tls_key: None,
+        browser_path: None,
+        browser_max_pages: 0,
+        browser_nav_timeout_ms: 30_000,
+        browser_disable: false,
     };
     assert!(matches!(
         Config::from_args(&args).unwrap_err(),
@@ -485,6 +497,12 @@ fn test_config_provider_validation() {
         worker_threads: 0,
         rate_limit: 0.0,
         dns_pin: true,
+        tls_cert: None,
+        tls_key: None,
+        browser_path: None,
+        browser_max_pages: 0,
+        browser_nav_timeout_ms: 30_000,
+        browser_disable: false,
     };
     assert!(matches!(
         Config::from_args(&args).unwrap_err(),
@@ -521,6 +539,12 @@ fn test_config_provider_validation() {
         worker_threads: 0,
         rate_limit: 0.0,
         dns_pin: true,
+        tls_cert: None,
+        tls_key: None,
+        browser_path: None,
+        browser_max_pages: 0,
+        browser_nav_timeout_ms: 30_000,
+        browser_disable: false,
     };
     assert!(Config::from_args(&args).is_ok());
 }

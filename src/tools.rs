@@ -10,16 +10,18 @@ pub struct ToolMeta {
 
 #[rustfmt::skip]
 pub const ALL_TOOLS: &[ToolMeta] = &[
-    ToolMeta { name: "web_search",       write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_scrape",       write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_map",          write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_extract",      write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_fetch",        write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_fetch_text",   write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_fetch_headers",write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_search_scrape",write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_sitemap",      write: false, idempotent: true, destructive: false },
-    ToolMeta { name: "web_check_links",  write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_search",        write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_scrape",        write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_map",           write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_extract",       write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_fetch",         write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_fetch_text",    write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_fetch_headers", write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_search_scrape", write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_sitemap",       write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "web_check_links",   write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "browser_scrape",    write: false, idempotent: true, destructive: false },
+    ToolMeta { name: "browser_screenshot",write: false, idempotent: true, destructive: false },
 ];
 
 /// Pre-deserialized tools list response, cached for the lifetime of the process.
@@ -68,6 +70,8 @@ mod tests {
             "web_search_scrape",
             "web_sitemap",
             "web_check_links",
+            "browser_scrape",
+            "browser_screenshot",
         ] {
             assert!(tool_exists(name), "tool_exists('{name}') should be true");
         }
@@ -88,6 +92,8 @@ mod tests {
             "web_search_scrape",
             "web_sitemap",
             "web_check_links",
+            "browser_scrape",
+            "browser_screenshot",
         ] {
             assert!(!is_write_tool(name), "is_write_tool('{name}') should be false");
         }
@@ -138,6 +144,8 @@ mod tests {
             "web_search_scrape",
             "web_sitemap",
             "web_check_links",
+            "browser_scrape",
+            "browser_screenshot",
         ] {
             assert!(names.contains(&expected), "Missing tool: {expected}");
         }

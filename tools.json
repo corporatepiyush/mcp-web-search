@@ -154,5 +154,47 @@
       "required": ["urls"]
     },
     "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "browser_scrape",
+    "description": "Navigate to a URL using a real headless browser (Chrome/Chromium via CDP) and return its content. Unlike web_scrape, this executes JavaScript — use it for SPAs, lazy-loaded content, pages that require JS to render, or when you need to interact with the page before extracting content. Requires Chrome/Chromium to be installed (see --browser-path). SSRF-guarded: only public http/https URLs are allowed. Each concurrent browser page consumes ~50-200 MB RAM; concurrency is bounded by --browser-max-pages.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "The http/https URL to navigate to. Must resolve to a public address." },
+        "formats": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["markdown", "html", "rawHtml", "links", "screenshot"]
+          },
+          "description": "Content formats to return (default ['markdown']). 'screenshot' returns a base64 PNG image block alongside any text blocks."
+        },
+        "onlyMainContent": { "type": "boolean", "description": "Isolate the main/article region before conversion (default false)." },
+        "waitFor": { "type": "string", "description": "CSS selector to wait for before extracting content. Useful for SPAs that render asynchronously." },
+        "waitTimeoutMs": { "type": "number", "description": "Milliseconds to wait for waitFor selector before proceeding anyway (default 5000)." },
+        "javascript": { "type": "string", "description": "JavaScript snippet to evaluate in the page after navigation and before content extraction. Errors are silently ignored." },
+        "scrollToBottom": { "type": "boolean", "description": "Scroll to the bottom of the page before extracting content (default false). Useful for triggering infinite-scroll / lazy-loaded content." }
+      },
+      "required": ["url"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "browser_screenshot",
+    "description": "Navigate to a URL using a real headless browser and return a PNG screenshot as a base64-encoded MCP image content block. Use this when you need a visual representation of a page — to debug layout, capture charts/diagrams, or verify rendering of JS-heavy pages. Requires Chrome/Chromium (see --browser-path). SSRF-guarded.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "The http/https URL to screenshot." },
+        "fullPage": { "type": "boolean", "description": "Capture the full scrollable page height instead of just the viewport (default false)." },
+        "width": { "type": "number", "description": "Viewport width in pixels (default 1280, clamped to 3840)." },
+        "height": { "type": "number", "description": "Viewport height in pixels (default 800, clamped to 2160)." },
+        "waitFor": { "type": "string", "description": "CSS selector to wait for before taking the screenshot." },
+        "waitTimeoutMs": { "type": "number", "description": "Milliseconds to wait for waitFor selector (default 5000)." }
+      },
+      "required": ["url"]
+    },
+    "annotations": { "readOnlyHint": true }
   }
 ]

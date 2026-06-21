@@ -15,6 +15,7 @@ High-performance, SSRF-hardened MCP server for web search, scraping, URL discove
 - **Web Scrape** — fetch and clean page content with optional main-content extraction
 - **Web Map** — site URL discovery via sitemap.xml + in-page link crawling
 - **Web Extract** — mass parallel scrape of 100s of URLs with bounded concurrency
+- **Headless Browser** — `browser_scrape` and `browser_screenshot` tools that run real Chrome/Chromium (CDP), executing JavaScript for SPAs and lazy-loaded content
 - **SSRF Guard** — blocks private/meta/link-local addresses by default, with DNS-rebinding protection (pinned connections) on every outbound request path
 - **Constant-time auth** — bearer token compared with `subtle` (constant-time), loadable from a file via `--auth-token-file` (fails closed if the file is missing or empty)
 - **CPU-core scaling** — auto-detects core count and scales thread pool, connection limits, and concurrency
@@ -37,7 +38,42 @@ mcp-web-search --auth-token "my-secret-token"
 
 # Serve the HTTP transport over TLS (HTTPS)
 mcp-web-search --http-port 3001 --tls-cert ./cert.pem --tls-key ./key.pem
+
+# With headless browser support (Chrome auto-detected from PATH)
+mcp-web-search --stdio
+
+# Explicit Chrome binary path
+mcp-web-search --stdio --browser-path /usr/bin/chromium
+
+# Disable headless browser tools (browser_scrape / browser_screenshot return errors)
+mcp-web-search --stdio --browser-disable
 ```
+
+### Headless Browser
+
+`browser_scrape` and `browser_screenshot` use Chrome/Chromium via the Chrome DevTools
+Protocol (CDP). This enables JavaScript execution, SPA support, lazy-loaded content, and
+visual screenshots.
+
+**Requirements:** Chrome or Chromium must be installed. The binary is auto-detected from
+PATH, or set explicitly with `--browser-path` / `BROWSER_PATH`.
+
+**Resource bounds:** Each concurrent browser page uses roughly 50–200 MB RAM. Concurrency
+is capped at `--browser-max-pages` (default: `2×num_cpus`, min 4). The browser process is
+launched lazily on the first browser tool call and reused across requests.
+
+**Security:** URLs are validated by the same SSRF guard as all other tools before being
+passed to the browser. Only `http://` and `https://` URLs are accepted. The browser is
+launched with `--block-new-web-contents` to prevent malicious pages from opening secondary
+navigations to internal hosts. `--no-sandbox` is required in containerised environments
+(standard practice for headless Chrome in Docker/Kubernetes).
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--browser-path` | `BROWSER_PATH` | auto | Path to Chrome/Chromium binary |
+| `--browser-max-pages` | `BROWSER_MAX_PAGES` | `2×cpus` (min 4) | Max concurrent pages |
+| `--browser-nav-timeout-ms` | `BROWSER_NAV_TIMEOUT_MS` | 30000 | Navigation timeout (ms) |
+| `--browser-disable` | `BROWSER_DISABLE` | false | Disable browser tools entirely |
 
 ### TLS (HTTPS)
 
@@ -68,7 +104,7 @@ Implements the [Model Context Protocol](https://modelcontextprotocol.io) revisio
 | Transports | stdio, TCP, HTTP (`POST /rpc`) |
 | Protocol version | `2025-11-25`, negotiates down to `2025-06-18` / `2025-03-26` / `2024-11-05` |
 | `initialize` | ✅ version negotiation + `instructions` |
-| `tools/list`, `tools/call` | ✅ (10 tools) |
+| `tools/list`, `tools/call` | ✅ (12 tools) |
 | `CallToolResult` | ✅ `content[]` + `isError` |
 | `logging/setLevel` | ✅ accepted (level acknowledged) |
 | Auth | ✅ optional bearer token (constant-time, `--auth-token` / `--auth-token-file`) |
