@@ -55,6 +55,23 @@ async fn inner_main(args: Args) -> Result<()> {
     let mcp_server = server::MCPServer::from_arc(Arc::clone(&config));
     info!("Server initialized successfully");
 
+    // Tool exposure: nothing is advertised unless a category was enabled.
+    let enabled = &config.server.enabled_categories;
+    if enabled.is_empty() {
+        warn!(
+            "No tool categories enabled — the server will expose ZERO tools. \
+             Enable categories with --enable-<category> (e.g. --enable-search --enable-fetch) \
+             or expose everything with --enable-all."
+        );
+    } else {
+        let slugs: Vec<&str> = enabled.iter().map(|c| c.slug()).collect();
+        let exposed = mcp_web_search::tools::ALL_TOOLS
+            .iter()
+            .filter(|t| enabled.contains(&t.category))
+            .count();
+        info!(categories = %slugs.join(", "), tools = exposed, "Tool categories enabled");
+    }
+
     if !is_loopback_host(&config.server.host)
         && config.server.auth_token.is_none()
         && !args.stdio
@@ -69,29 +86,10 @@ async fn inner_main(args: Args) -> Result<()> {
         info!("Running in stdio mode");
         mcp_server.run_stdio().await?;
     } else {
-        let tcp_host = config.server.host.clone();
-        let tcp_port = config.server.port;
-        info!(host = %tcp_host, port = %tcp_port, "Starting TCP server");
-
-        let tcp_server = server::MCPServer::from_arc(Arc::clone(&config));
-        let tcp_handle = tokio::spawn(async move {
-            if let Err(e) = tcp_server.run().await {
-                eprintln!("TCP server error: {e}");
-            }
-        });
-
-        let http_config = Arc::clone(&config);
-        let http_port = args.http_port;
-        let http_handle = tokio::spawn(async move {
-            if let Err(e) = http::create_http_server(http_config, http_port).await {
-                eprintln!("HTTP server error: {e}");
-            }
-        });
-
-        tokio::select! {
-            _ = tcp_handle => info!("TCP server exited"),
-            _ = http_handle => info!("HTTP server exited"),
-        }
+        info!(host = %config.server.host, port = args.http_port, "Starting HTTP server");
+        http::create_http_server(Arc::clone(&config), args.http_port)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     }
 
     info!("Server shutdown complete");

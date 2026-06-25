@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
+
+pub use crate::tools::ToolCategory;
 
 /// Configuration for the optional headless browser (Chrome/Chromium via CDP).
 #[derive(Debug, Clone)]
@@ -104,15 +107,16 @@ impl FromStr for SearchProvider {
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub host: String,
-    pub port: u16,
     pub http_port: u16,
     pub request_timeout: Duration,
     pub max_request_bytes: usize,
     pub max_extract_urls: usize,
     pub max_map_urls: usize,
     pub auth_token: Option<Arc<str>>,
-    pub max_connections: usize,
     pub rate_limit: f64,
+    /// Tool categories exposed by this server. Empty (the default) means no
+    /// tools are advertised or callable until enabled with `--enable-*`.
+    pub enabled_categories: Vec<ToolCategory>,
     /// PEM certificate chain for serving the HTTP transport over TLS (HTTPS).
     /// `None` (the default) keeps the HTTP transport plaintext. Engaged only
     /// when both `tls_cert` and `tls_key` are set.
@@ -144,6 +148,10 @@ pub struct Config {
     pub allow_private_hosts: bool,
     pub dns_pin: bool,
     pub browser: BrowserSettings,
+    /// Pre-built `{"tools":[...]}` payload for `tools/list`, filtered to the
+    /// enabled categories (see `server.enabled_categories`). Built once at
+    /// construction so every request serves an identical, filtered list.
+    pub tools_list: Arc<Value>,
 }
 
 impl Config {
@@ -189,6 +197,8 @@ impl Config {
         }
 
         let cpus = *CPU_COUNT;
+        let enabled_categories = args.enabled_categories();
+        let tools_list = Arc::new(crate::tools::build_tools_list(&enabled_categories));
 
         Ok(Config {
             provider,
@@ -205,7 +215,6 @@ impl Config {
             },
             server: ServerConfig {
                 host: args.host.clone(),
-                port: args.port,
                 http_port: args.http_port,
                 request_timeout: Duration::from_secs(args.request_timeout),
                 max_request_bytes: args.max_request_bytes,
@@ -243,12 +252,8 @@ impl Config {
                     };
                     raw.map(|s| Arc::from(s.as_str()))
                 },
-                max_connections: if args.max_connections > 0 {
-                    args.max_connections
-                } else {
-                    (cpus * 256).max(64)
-                },
                 rate_limit: args.rate_limit.max(0.0),
+                enabled_categories,
                 tls_cert,
                 tls_key,
             },
@@ -270,6 +275,7 @@ impl Config {
                     .filter(|s| !s.is_empty())
                     .map(std::path::PathBuf::from),
             },
+            tools_list,
         })
     }
 }
@@ -292,15 +298,14 @@ impl Default for Config {
             },
             server: ServerConfig {
                 host: "127.0.0.1".into(),
-                port: 3000,
                 http_port: 3001,
                 request_timeout: Duration::from_secs(30),
                 max_request_bytes: 1024 * 1024,
                 max_extract_urls: (cpus * 2).max(100),
                 max_map_urls: (cpus * 100).clamp(1000, 100_000),
                 auth_token: None,
-                max_connections: (cpus * 256).max(64),
                 rate_limit: 0.0,
+                enabled_categories: Vec::new(),
                 tls_cert: None,
                 tls_key: None,
             },
@@ -309,6 +314,7 @@ impl Default for Config {
             allow_private_hosts: false,
             dns_pin: true,
             browser: BrowserSettings::default(),
+            tools_list: Arc::new(crate::tools::build_tools_list(&[])),
         }
     }
 }
@@ -332,7 +338,6 @@ mod tests {
             engines: "all".into(),
             timeout: 10_000,
             host: "127.0.0.1".into(),
-            port: 3000,
             http_port: 3001,
             stdio: false,
             log_level: "info".into(),
@@ -343,7 +348,6 @@ mod tests {
             allow_private_hosts: false,
             auth_token: None,
             auth_token_file: None,
-            max_connections: 0,
             max_extract_urls: 0,
             max_map_urls: 0,
             worker_threads: 0,
@@ -355,6 +359,11 @@ mod tests {
             browser_max_pages: 0,
             browser_nav_timeout_ms: 30_000,
             browser_disable: false,
+            enable_all: false,
+            enable_search: false,
+            enable_scrape: false,
+            enable_fetch: false,
+            enable_crawl: false,
         }
     }
 

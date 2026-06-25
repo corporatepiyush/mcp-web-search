@@ -1,18 +1,15 @@
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{error, info, warn};
+use tracing::error;
 
 use crate::actions;
 use crate::config::Config;
 use crate::errors::{Result as WsResult, WebSearchError};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
-use crate::ratelimit::TokenBucket;
 use crate::tools;
 use std::sync::Arc;
 use tokio::io::BufReader;
-use tokio::sync::Semaphore;
 
 const BUFFER_CAPACITY: usize = 4096;
 const NEWLINE: &[u8] = b"\n";
@@ -82,14 +79,22 @@ where
             }
         }
     }
-    *out = String::from_utf8_lossy(buf).into_owned();
+    // Reuse `out`'s existing allocation rather than allocating a fresh String
+    // each call (the old `from_utf8_lossy(..).into_owned()` always allocated,
+    // negating the buffer reuse this fn documents). The common path — valid
+    // UTF-8 — is a single copy into the retained capacity; only malformed input
+    // pays for the lossy allocation.
+    match std::str::from_utf8(buf) {
+        Ok(s) => out.push_str(s),
+        Err(_) => out.push_str(&String::from_utf8_lossy(buf)),
+    }
     Ok(LineRead::Line)
 }
 
 /// Read a line subject to both the byte cap and an idle timeout. Returns
-/// `Ok(None)` if no complete line arrives within `idle` — used to drop
-/// slow/stalled TCP peers (slowloris) that would otherwise hold a connection
-/// slot open indefinitely without ever sending a full request.
+/// `Ok(None)` if no complete line arrives within `idle`. Retained for its unit
+/// tests; the timeout wrapper was used by the (now removed) TCP transport.
+#[cfg(test)]
 async fn read_line_capped_timed<R>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -159,8 +164,7 @@ impl MCPServer {
             match read_line_capped(&mut reader, &mut read_buf, &mut line, max).await {
                 Ok(LineRead::Eof) => break,
                 Ok(LineRead::Line) => {
-                    process_one_line(&line, &self.config, &None, &mut response_buf, &mut stdout)
-                        .await?;
+                    process_one_line(&line, &self.config, &mut response_buf, &mut stdout).await?;
                 }
                 Ok(LineRead::TooLong) => {
                     write_oversize_error(&mut response_buf, &mut stdout, max).await?;
@@ -175,158 +179,6 @@ impl MCPServer {
         Ok(())
     }
 
-    pub async fn run(&self) -> WsResult<()> {
-        let addr = format!("{}:{}", self.config.server.host, self.config.server.port);
-        let listener = Arc::new(
-            TcpListener::bind(&addr)
-                .await
-                .map_err(|e| WebSearchError::ConfigError(format!("bind {addr} failed: {e}")))?,
-        );
-        info!("MCP web-search TCP server listening on {addr}");
-
-        let conn_limiter = Arc::new(Semaphore::new(self.config.server.max_connections));
-        let rate_limiter = if self.config.server.rate_limit > 0.0 {
-            Some(Arc::new(TokenBucket::new(self.config.server.rate_limit)))
-        } else {
-            None
-        };
-        let accept_shards = num_cpus::get().clamp(1, 8);
-
-        info!(
-            accept_shards,
-            max_connections = self.config.server.max_connections,
-            rate_limit = self.config.server.rate_limit,
-            "Starting TCP accept tasks"
-        );
-
-        let mut handles = Vec::with_capacity(accept_shards);
-        for _ in 0..accept_shards {
-            let listener = Arc::clone(&listener);
-            let conn_limiter = Arc::clone(&conn_limiter);
-            let rate_limiter = rate_limiter.as_ref().map(Arc::clone);
-            let config = Arc::clone(&self.config);
-            handles.push(tokio::spawn(async move {
-                accept_loop(listener, conn_limiter, rate_limiter, config).await;
-            }));
-        }
-
-        // Wait for any accept task to exit (should not happen in normal operation)
-        for h in handles {
-            h.await.ok();
-        }
-
-        Ok(())
-    }
-}
-
-/// Per-shard accept loop. Multiple copies of this function run concurrently,
-/// each accepting connections from the same shared `TcpListener`. Tokio's IO
-/// driver distributes incoming connections across the waiting tasks, providing
-/// near-kernel-level accept scaling without `SO_REUSEPORT`.
-async fn accept_loop(
-    listener: Arc<TcpListener>,
-    conn_limiter: Arc<Semaphore>,
-    rate_limiter: Option<Arc<TokenBucket>>,
-    config: Arc<Config>,
-) {
-    loop {
-        let permit = match Arc::clone(&conn_limiter).acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                error!("Connection semaphore closed, exiting accept loop");
-                return;
-            }
-        };
-        let (socket, peer_addr) = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Accept failed: {e}");
-                continue;
-            }
-        };
-        if let Err(e) = socket.set_nodelay(true) {
-            warn!("Failed to set TCP_NODELAY: {e}");
-        }
-        let config = Arc::clone(&config);
-        let rate_limiter = rate_limiter.as_ref().map(Arc::clone);
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(socket, config, rate_limiter).await {
-                error!("Client {peer_addr} error: {e}");
-            }
-            drop(permit);
-        });
-    }
-}
-
-async fn handle_client(
-    socket: TcpStream,
-    config: Arc<Config>,
-    rate_limiter: Option<Arc<TokenBucket>>,
-) -> WsResult<()> {
-    let (reader, mut writer) = socket.into_split();
-    let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, reader);
-    let mut line = String::with_capacity(INITIAL_LINE_CAP);
-    let mut read_buf = Vec::with_capacity(INITIAL_LINE_CAP);
-    let mut response_buf = Vec::with_capacity(INITIAL_RESP_BUF);
-    let max = config.server.max_request_bytes;
-    // Idle/read timeout: a peer that opens a connection but never sends a
-    // complete line is dropped instead of holding the slot forever (slowloris).
-    let idle = config.server.request_timeout;
-
-    if let Some(ref expected) = config.server.auth_token {
-        match read_line_capped_timed(&mut reader, &mut read_buf, &mut line, max, idle).await {
-            Ok(Some(LineRead::Line)) if token_matches(&line, expected) => {
-                info!("Client authenticated successfully");
-            }
-            Ok(Some(LineRead::Eof)) => {
-                warn!("Client disconnected before sending auth token");
-                return Ok(());
-            }
-            Ok(None) => {
-                warn!("Client idle timeout before sending auth token");
-                return Ok(());
-            }
-            _ => {
-                warn!("Authentication failed (invalid token)");
-                let err = WebSearchError::InvalidParams(
-                    "Authentication required: send the bearer token as the first line".into(),
-                );
-                let response =
-                    JsonRpcResponse::error(None, err.error_code(), err.to_string());
-                response_buf.clear();
-                serde_json::to_writer(&mut response_buf, &response)?;
-                response_buf.extend_from_slice(NEWLINE);
-                writer.write_all(&response_buf).await.ok();
-                writer.flush().await.ok();
-                return Ok(());
-            }
-        }
-    }
-
-    loop {
-        match read_line_capped_timed(&mut reader, &mut read_buf, &mut line, max, idle).await {
-            Ok(Some(LineRead::Eof)) => break,
-            Ok(Some(LineRead::Line)) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                process_one_line(&line, &config, &rate_limiter, &mut response_buf, &mut writer).await?;
-            }
-            Ok(Some(LineRead::TooLong)) => {
-                write_oversize_error(&mut response_buf, &mut writer, max).await?;
-                break;
-            }
-            Ok(None) => {
-                warn!("Client idle timeout; closing connection");
-                break;
-            }
-            Err(e) => {
-                error!("IO error reading from client: {e}");
-                break;
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn write_oversize_error<W: AsyncWriteExt + Unpin>(
@@ -349,27 +201,9 @@ async fn write_oversize_error<W: AsyncWriteExt + Unpin>(
 async fn process_one_line<W: AsyncWriteExt + Unpin>(
     line: &str,
     config: &Arc<Config>,
-    rate_limiter: &Option<Arc<TokenBucket>>,
     response_buf: &mut Vec<u8>,
     writer: &mut W,
 ) -> WsResult<()> {
-    if let Some(limiter) = rate_limiter {
-        if !limiter.try_acquire() {
-            let err = WebSearchError::RateLimited("Rate limit exceeded. Try again later.".into());
-            let response = JsonRpcResponse::error_with_data(
-                None,
-                err.error_code(),
-                err.to_string(),
-                err.error_data().unwrap_or_default(),
-            );
-            response_buf.clear();
-            serde_json::to_writer(&mut *response_buf, &response)?;
-            response_buf.extend_from_slice(NEWLINE);
-            writer.write_all(response_buf).await.ok();
-            writer.flush().await.ok();
-            return Ok(());
-        }
-    }
     let (response, is_notification) = match parse_request(line) {
         Ok(req) => {
             let is_notif = req.id.is_none();
@@ -412,13 +246,25 @@ async fn process_one_line<W: AsyncWriteExt + Unpin>(
     response_buf.extend_from_slice(NEWLINE);
     writer.write_all(response_buf).await.ok();
     writer.flush().await.ok();
+    maybe_shrink_buf(response_buf);
     Ok(())
+}
+
+/// Release an oversized response buffer back to a small capacity. A single large
+/// response (up to `max_response_bytes`) would otherwise pin that capacity for
+/// the whole connection; this caps idle memory between requests.
+#[inline]
+fn maybe_shrink_buf(buf: &mut Vec<u8>) {
+    const SHRINK_THRESHOLD: usize = 1 << 20; // 1 MiB
+    if buf.capacity() > SHRINK_THRESHOLD {
+        *buf = Vec::with_capacity(INITIAL_RESP_BUF);
+    }
 }
 
 pub async fn process_request(req: &JsonRpcRequest, config: &Config) -> WsResult<Value> {
     match req.method.as_str() {
         "initialize" => handle_initialize(req),
-        "tools/list" => handle_tools_list(),
+        "tools/list" => handle_tools_list(config),
         "tools/call" => handle_tools_call(req, config).await,
         // Accept and acknowledge the client's desired log level. We advertise the
         // `logging` capability; this makes the method real rather than a 404.
@@ -519,8 +365,9 @@ fn timeout_response(req: &JsonRpcRequest, timeout_secs: u64) -> JsonRpcResponse 
     }
 }
 
-fn handle_tools_list() -> WsResult<Value> {
-    Ok(tools::tools_list_response().clone())
+fn handle_tools_list(config: &Config) -> WsResult<Value> {
+    // The per-config payload is already filtered to the enabled categories.
+    Ok((*config.tools_list).clone())
 }
 
 async fn handle_tools_call(req: &JsonRpcRequest, config: &Config) -> WsResult<Value> {
@@ -532,7 +379,10 @@ async fn handle_tools_call(req: &JsonRpcRequest, config: &Config) -> WsResult<Va
 
     let tool_args = req.params.as_ref().and_then(|p| p.get("arguments"));
 
-    if !tools::tool_exists(tool_name) {
+    // Category gate: a tool is reachable only if it exists AND its category was
+    // enabled at startup. Tools in disabled categories are invisible (absent
+    // from tools/list), so a call to one is an unknown method.
+    if !tools::is_tool_available(tool_name, &config.server.enabled_categories) {
         return Err(WebSearchError::MethodNotFound(tool_name.to_string()));
     }
 
@@ -655,10 +505,24 @@ mod tests {
 
     #[test]
     fn test_tools_list_response() {
-        let v = handle_tools_list().unwrap();
+        // Default config exposes nothing.
+        let empty = Config::default();
+        assert_eq!(
+            handle_tools_list(&empty).unwrap()["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // A config with every category enabled exposes the full set.
+        let mut cfg = Config::default();
+        cfg.server.enabled_categories = tools::ToolCategory::ALL.to_vec();
+        cfg.tools_list = std::sync::Arc::new(tools::build_tools_list(tools::ToolCategory::ALL));
+        let v = handle_tools_list(&cfg).unwrap();
         assert!(v.get("tools").is_some());
-        let tools = v["tools"].as_array().unwrap();
-        assert!(!tools.is_empty());
+        let list = v["tools"].as_array().unwrap();
+        assert!(!list.is_empty());
     }
 
     #[test]

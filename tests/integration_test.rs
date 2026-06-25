@@ -1,10 +1,22 @@
 use serde_json::Value;
 
+/// A `Config` with every tool category enabled, for tests that exercise
+/// `tools/list` and `tools/call`. The production default exposes no tools.
+fn all_enabled_config() -> mcp_web_search::config::Config {
+    use mcp_web_search::tools::ToolCategory;
+    let mut config = mcp_web_search::config::Config::default();
+    config.server.enabled_categories = ToolCategory::ALL.to_vec();
+    config.tools_list = std::sync::Arc::new(mcp_web_search::tools::build_tools_list(
+        ToolCategory::ALL,
+    ));
+    config
+}
+
 /// A simple in-memory test for the full MCP request flow:
 /// initialize → tools/list → tools/call (validation) → ping
 #[test]
 fn test_mcp_protocol_initialize() {
-    let config = mcp_web_search::config::Config::default();
+    let config = all_enabled_config();
     let req = mcp_web_search::protocol::JsonRpcRequest {
         jsonrpc: "2.0".into(),
         method: "initialize".into(),
@@ -25,7 +37,7 @@ fn test_mcp_protocol_initialize() {
 
 #[test]
 fn test_mcp_protocol_tools_list() {
-    let config = mcp_web_search::config::Config::default();
+    let config = all_enabled_config();
     let req = mcp_web_search::protocol::JsonRpcRequest {
         jsonrpc: "2.0".into(),
         method: "tools/list".into(),
@@ -72,7 +84,7 @@ fn test_mcp_protocol_tools_list() {
 
 #[test]
 fn test_mcp_protocol_ping() {
-    let config = mcp_web_search::config::Config::default();
+    let config = all_enabled_config();
     let req = mcp_web_search::protocol::JsonRpcRequest {
         jsonrpc: "2.0".into(),
         method: "ping".into(),
@@ -87,7 +99,7 @@ fn test_mcp_protocol_ping() {
 
 #[test]
 fn test_mcp_protocol_unknown_method() {
-    let config = mcp_web_search::config::Config::default();
+    let config = all_enabled_config();
     let req = mcp_web_search::protocol::JsonRpcRequest {
         jsonrpc: "2.0".into(),
         method: "unknown".into(),
@@ -106,7 +118,7 @@ fn test_mcp_protocol_unknown_method() {
 
 #[test]
 fn test_mcp_protocol_notification_is_ok() {
-    let config = mcp_web_search::config::Config::default();
+    let config = all_enabled_config();
     let req = mcp_web_search::protocol::JsonRpcRequest {
         jsonrpc: "2.0".into(),
         method: "notifications/initialized".into(),
@@ -121,7 +133,7 @@ fn test_mcp_protocol_notification_is_ok() {
 
 #[test]
 fn test_mcp_tools_call_validation() {
-    let config = mcp_web_search::config::Config::default();
+    let config = all_enabled_config();
 
     // Missing 'name' parameter
     let req = mcp_web_search::protocol::JsonRpcRequest {
@@ -275,8 +287,9 @@ fn test_json_rpc_request_response_flow() {
 
 #[test]
 fn test_tools_list_response_cached() {
-    let first = mcp_web_search::tools::tools_list_response().clone();
-    let second = mcp_web_search::tools::tools_list_response().clone();
+    use mcp_web_search::tools::ToolCategory;
+    let first = mcp_web_search::tools::build_tools_list(ToolCategory::ALL);
+    let second = mcp_web_search::tools::build_tools_list(ToolCategory::ALL);
     assert_eq!(first, second);
 
     let tools = first["tools"].as_array().unwrap();
@@ -326,7 +339,6 @@ fn test_auth_token_from_file() {
         engines: "all".into(),
         timeout: 10000,
         host: "127.0.0.1".into(),
-        port: 3000,
         http_port: 3001,
         stdio: false,
         log_level: "info".into(),
@@ -337,7 +349,6 @@ fn test_auth_token_from_file() {
         allow_private_hosts: false,
         auth_token: None,
         auth_token_file: Some(path.to_string_lossy().into()),
-        max_connections: 1024,
         max_extract_urls: 100,
         max_map_urls: 10000,
         worker_threads: 0,
@@ -349,6 +360,11 @@ fn test_auth_token_from_file() {
         browser_max_pages: 0,
         browser_nav_timeout_ms: 30_000,
         browser_disable: false,
+        enable_all: false,
+        enable_search: false,
+        enable_scrape: false,
+        enable_fetch: false,
+        enable_crawl: false,
     };
     let cfg = mcp_web_search::config::Config::from_args(&args).unwrap();
     assert_eq!(
@@ -438,7 +454,6 @@ fn test_config_provider_validation() {
         engines: "all".into(),
         timeout: 10000,
         host: "127.0.0.1".into(),
-        port: 3000,
         http_port: 3001,
         stdio: false,
         log_level: "info".into(),
@@ -449,7 +464,6 @@ fn test_config_provider_validation() {
         allow_private_hosts: false,
         auth_token: None,
         auth_token_file: None,
-        max_connections: 1024,
         max_extract_urls: 100,
         max_map_urls: 10000,
         worker_threads: 0,
@@ -461,6 +475,11 @@ fn test_config_provider_validation() {
         browser_max_pages: 0,
         browser_nav_timeout_ms: 30_000,
         browser_disable: false,
+        enable_all: false,
+        enable_search: false,
+        enable_scrape: false,
+        enable_fetch: false,
+        enable_crawl: false,
     };
     assert!(matches!(
         Config::from_args(&args).unwrap_err(),
@@ -480,7 +499,6 @@ fn test_config_provider_validation() {
         engines: "all".into(),
         timeout: 10000,
         host: "127.0.0.1".into(),
-        port: 3000,
         http_port: 3001,
         stdio: false,
         log_level: "info".into(),
@@ -491,7 +509,6 @@ fn test_config_provider_validation() {
         allow_private_hosts: false,
         auth_token: None,
         auth_token_file: None,
-        max_connections: 1024,
         max_extract_urls: 100,
         max_map_urls: 10000,
         worker_threads: 0,
@@ -503,6 +520,11 @@ fn test_config_provider_validation() {
         browser_max_pages: 0,
         browser_nav_timeout_ms: 30_000,
         browser_disable: false,
+        enable_all: false,
+        enable_search: false,
+        enable_scrape: false,
+        enable_fetch: false,
+        enable_crawl: false,
     };
     assert!(matches!(
         Config::from_args(&args).unwrap_err(),
@@ -522,7 +544,6 @@ fn test_config_provider_validation() {
         engines: "all".into(),
         timeout: 10000,
         host: "127.0.0.1".into(),
-        port: 3000,
         http_port: 3001,
         stdio: false,
         log_level: "info".into(),
@@ -533,7 +554,6 @@ fn test_config_provider_validation() {
         allow_private_hosts: false,
         auth_token: None,
         auth_token_file: None,
-        max_connections: 1024,
         max_extract_urls: 100,
         max_map_urls: 10000,
         worker_threads: 0,
@@ -545,6 +565,11 @@ fn test_config_provider_validation() {
         browser_max_pages: 0,
         browser_nav_timeout_ms: 30_000,
         browser_disable: false,
+        enable_all: false,
+        enable_search: false,
+        enable_scrape: false,
+        enable_fetch: false,
+        enable_crawl: false,
     };
     assert!(Config::from_args(&args).is_ok());
 }

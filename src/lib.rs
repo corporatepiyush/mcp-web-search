@@ -57,9 +57,6 @@ pub struct Args {
     #[arg(short = 'H', long, default_value = "127.0.0.1")]
     pub host: String,
 
-    #[arg(short = 'p', long, default_value = "3000")]
-    pub port: u16,
-
     #[arg(long, default_value = "3001")]
     pub http_port: u16,
 
@@ -89,9 +86,6 @@ pub struct Args {
 
     #[arg(long, help = "Read auth token from file (more secure than --auth-token which is visible in process list)")]
     pub auth_token_file: Option<String>,
-
-    #[arg(long, default_value_t = 0, help = "Max concurrent TCP connections (0 = auto-scale to num_cpus * 256)")]
-    pub max_connections: usize,
 
     #[arg(long, default_value_t = 0, help = "Max URLs for web_extract (0 = auto-scale to num_cpus * 2)")]
     pub max_extract_urls: usize,
@@ -125,4 +119,47 @@ pub struct Args {
 
     #[arg(long, env = "BROWSER_DISABLE", help = "Disable headless browser tools entirely; browser_scrape and browser_screenshot return errors")]
     pub browser_disable: bool,
+
+    // ── Tool exposure ────────────────────────────────────────────────────
+    // No tools are exposed unless explicitly enabled. Each flag turns on one
+    // category (hidden from tools/list and rejected from tools/call when its
+    // category is disabled). Use --enable-all for every category at once.
+    #[arg(long, help = "Expose ALL tool categories (overrides the individual --enable-* flags)")]
+    pub enable_all: bool,
+
+    #[arg(long, help = "Enable Search tools: web_search, web_search_scrape")]
+    pub enable_search: bool,
+
+    #[arg(long, help = "Enable Scrape tools: web_scrape, web_extract, browser_scrape, browser_screenshot")]
+    pub enable_scrape: bool,
+
+    #[arg(long, help = "Enable Fetch tools: web_fetch, web_fetch_text, web_fetch_headers")]
+    pub enable_fetch: bool,
+
+    #[arg(long, help = "Enable Crawl tools: web_map, web_sitemap, web_check_links")]
+    pub enable_crawl: bool,
+}
+
+impl Args {
+    /// Resolve the set of enabled tool categories from the `--enable-*` flags.
+    /// `--enable-all` turns on every category; otherwise only the categories
+    /// whose individual flag is set. With no flags, the result is empty and no
+    /// tools are exposed.
+    pub fn enabled_categories(&self) -> Vec<tools::ToolCategory> {
+        use tools::ToolCategory as C;
+        if self.enable_all {
+            return C::ALL.to_vec();
+        }
+        let mut cats = Vec::new();
+        let mut push = |on: bool, cat: C| {
+            if on {
+                cats.push(cat);
+            }
+        };
+        push(self.enable_search, C::Search);
+        push(self.enable_scrape, C::Scrape);
+        push(self.enable_fetch, C::Fetch);
+        push(self.enable_crawl, C::Crawl);
+        cats
+    }
 }

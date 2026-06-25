@@ -2,6 +2,13 @@
 
 High-performance, SSRF-hardened MCP server for web search, scraping, URL discovery, and multi-URL content extraction — a secure Rust alternative to `one-search-mcp`.
 
+> **Tools are opt-in (2.3.0+).** No tools are exposed by default. Enable them one
+> *category* at a time with `--enable-<category>` flags (or `--enable-all`). See
+> [Tool Exposure](#tool-exposure-opt-in-by-category).
+
+> **TCP removed (2.3.0+).** The line-delimited TCP transport has been dropped;
+> use **stdio** (for MCP clients) or **HTTP**.
+
 > **MCP suite.** One of four high-performance MCP servers written in Rust —
 > [mcp-postgres](https://github.com/corporatepiyush/mcp-pg-rust) ·
 > [mcp-filesystem](https://github.com/corporatepiyush/mcp-filesystem-rust) ·
@@ -23,31 +30,42 @@ High-performance, SSRF-hardened MCP server for web search, scraping, URL discove
 
 ## Usage
 
+Tools are opt-in — pass one or more `--enable-<category>` flags (or
+`--enable-all`). Without them the server exposes no tools.
+
 ```bash
-# Run in stdio mode (for MCP clients)
-mcp-web-search --stdio
+# Run in stdio mode (for MCP clients) — search + fetch tools
+mcp-web-search --stdio --enable-search --enable-fetch
 
-# Run as TCP server
-mcp-web-search --host 127.0.0.1 --port 3000
-
-# Run as HTTP server
-mcp-web-search --http-port 3001
+# Run as HTTP server with every tool
+mcp-web-search --http-port 3001 --enable-all
 
 # With auth
-mcp-web-search --auth-token "my-secret-token"
+mcp-web-search --http-port 3001 --enable-all --auth-token "my-secret-token"
 
 # Serve the HTTP transport over TLS (HTTPS)
-mcp-web-search --http-port 3001 --tls-cert ./cert.pem --tls-key ./key.pem
+mcp-web-search --http-port 3001 --enable-all --tls-cert ./cert.pem --tls-key ./key.pem
 
-# With headless browser support (Chrome auto-detected from PATH)
-mcp-web-search --stdio
-
-# Explicit Chrome binary path
-mcp-web-search --stdio --browser-path /usr/bin/chromium
+# Explicit Chrome binary path (headless browser tools are in the `scrape` category)
+mcp-web-search --stdio --enable-scrape --browser-path /usr/bin/chromium
 
 # Disable headless browser tools (browser_scrape / browser_screenshot return errors)
-mcp-web-search --stdio --browser-disable
+mcp-web-search --stdio --enable-scrape --browser-disable
 ```
+
+### Tool Exposure (opt-in by category)
+
+Every tool belongs to one of **4 categories**. **Nothing is exposed until you
+enable its category** — disabled tools are hidden from `tools/list` and rejected
+from `tools/call` as if they did not exist.
+
+| Flag | Category | Tools |
+|------|----------|-------|
+| `--enable-search` | **Search** | `web_search`, `web_search_scrape` |
+| `--enable-scrape` | **Scrape** | `web_scrape`, `web_extract`, `browser_scrape`, `browser_screenshot` |
+| `--enable-fetch` | **Fetch** | `web_fetch`, `web_fetch_text`, `web_fetch_headers` |
+| `--enable-crawl` | **Crawl** | `web_map`, `web_sitemap`, `web_check_links` |
+| `--enable-all` | *(all)* | Every category. Overrides the individual flags. |
 
 ### Headless Browser
 
@@ -82,7 +100,7 @@ backend as the reqwest search client). Provide a PEM certificate chain and
 private key via `--tls-cert`/`--tls-key` or the `MCP_TLS_CERT`/`MCP_TLS_KEY`
 environment variables and the HTTP server speaks HTTPS instead of plaintext. The
 two must be supplied together or startup is refused; when neither is set the HTTP
-transport stays plaintext (the default). The TCP transport is unaffected.
+transport stays plaintext (the default).
 
 ### Environment Variables
 

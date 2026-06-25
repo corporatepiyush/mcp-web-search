@@ -10,7 +10,11 @@ fn rt() -> tokio::runtime::Runtime {
 }
 
 fn call(method: &str, params: Value) -> Result<Value, String> {
-    let config = Config::default();
+    use mcp_web_search::tools::ToolCategory;
+    let mut config = Config::default();
+    config.server.enabled_categories = ToolCategory::ALL.to_vec();
+    config.tools_list =
+        std::sync::Arc::new(mcp_web_search::tools::build_tools_list(ToolCategory::ALL));
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         method: method.into(),
